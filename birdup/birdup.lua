@@ -1,6 +1,6 @@
 _addon.name     = 'birdup'
 _addon.author   = 'Valdimar @ Phoenix' -- auto-dig based on Velner/chocodig
-_addon.version  = '1.6'
+_addon.version  = '2.3'
 _addon.commands = {'birdup', 'bup'}
 
 local texts  = require('texts')
@@ -17,7 +17,12 @@ local defaults = {
     required_distance = 5,     -- yalms (2D) to travel between digs
     move_timeout      = 8,
     turn_distance     = 3,     -- yalms to move after turning away from undiggable ground
-    result_timeout    = 5,     -- seconds to wait for a dig result before treating the spot as undiggable
+    dig_settle        = 2.5,   -- seconds to let the dig animation finish before turning and moving
+    turn_chance       = 50,    -- % chance to turn after a dig (otherwise keep going the same way)
+    roam_radius       = 20,    -- stay within this many yalms of where auto-dig started (0 = no limit)
+    result_timeout    = 5,
+    bad_ground_limit  = 7,     -- stop and alert after this many "can't dig here" in a row (0 = never)
+    stop_echo         = 'Kweh! This ground is all wark and no dig. Find me a better spot!', -- extra echo with the alert     -- seconds to wait for a dig result before treating the spot as undiggable
     stuck_check_time  = 1.0,
     stuck_epsilon     = 0.2,
     max_success       = 100,   -- 0 = never auto-stop on count
@@ -47,15 +52,18 @@ end
 ---------------------------------------------------------------------------
 local S = {
     running = false, paused = false,
-    attempts = 0, successes = 0, fails = 0, free = 0, cur = {}, gil = 0,
+    attempts = 0, successes = 0, fails = 0, free = 0, discern = 0, cur = {}, gil = 0,
     drops = {},               -- item name -> count (this session)
     first_dig = nil,          -- os.time() of first attempt this session
     pending = nil,            -- os.clock() of last /dig, awaiting a result
 }
-local life = {attempts = 0, successes = 0, drops = {}, fatigue = 0, free = 0, day = 0, cur = {}, gil = 0, wing = nil, wing_approx = false}
+local life = {attempts = 0, successes = 0, drops = {}, fatigue = 0, free = 0, day = 0, cur = {}, gil = 0, wing = nil, wing_approx = false, discern = 0}
 local life_dirty, life_saved = false, 0
 
 local next_dig, last_dig_pos = 0, nil
+local anchor = nil -- {x, y}: centre of the area auto-dig stays in
+local settle_until = 0 -- don't turn or move before this (dig animation still playing)
+local turn_until = 0   -- after turning, wait this long before starting to run
 local moving, move_start_time, move_start_pos = false, 0, nil
 local prog_time, prog_pos = 0, nil
 local greens, greens_time = nil, 0
@@ -138,7 +146,7 @@ local history = {} -- yyyymmdd (JST) -> entry
 
 local function new_day_entry()
     return {attempts = 0, finds = 0, fails = 0, fatigue = 0, free = 0, sessions = 0,
-            secs = 0, gil = 0, wing = nil, cur = {}, drops = {}}
+            secs = 0, gil = 0, wing = nil, discern = 0, cur = {}, drops = {}}
 end
 
 local function history_path()
@@ -161,6 +169,7 @@ local function load_history()
             e.secs, e.gil, e.wing = tonumber(p[8]) or 0, tonumber(p[9]) or 0, tonumber(p[10])
             for k, n in (p[11] or ''):gmatch('([^=|]+)=(%d+)') do e.cur[k] = tonumber(n) end
             for k, n in (p[12] or ''):gmatch('([^=|]+)=(%d+)') do e.drops[k] = tonumber(n) end
+            e.discern = tonumber(p[13]) or 0
             history[d] = e
         end
     end
@@ -179,9 +188,9 @@ save_history = function()
         local cur, drops = {}, {}
         for k, n in pairs(e.cur) do cur[#cur + 1] = k .. '=' .. n end
         for k, n in pairs(e.drops) do drops[#drops + 1] = k .. '=' .. n end
-        f:write(('%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%s\t%s\t%s\n'):format(
+        f:write(('%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%s\t%s\t%s\t%d\n'):format(
             d, e.attempts, e.finds, e.fails, e.fatigue, e.free, e.sessions, e.secs, e.gil,
-            e.wing and tostring(e.wing) or '', table.concat(cur, '|'), table.concat(drops, '|')))
+            e.wing and tostring(e.wing) or '', table.concat(cur, '|'), table.concat(drops, '|'), e.discern or 0))
     end
     f:close()
 end
@@ -193,7 +202,7 @@ end
 
 local function load_life()
     life = {attempts = 0, successes = 0, drops = {}, fatigue = 0, free = 0, day = 0, cur = {}, gil = 0,
-            wing = nil, wing_approx = false}
+            wing = nil, wing_approx = false, discern = 0}
     life_dirty = false
     local f = io.open(life_path(), 'r')
     if not f then return end
@@ -208,6 +217,7 @@ local function load_life()
             elseif k:match('^#cur_') then life.cur[k:sub(6)] = tonumber(v)
             elseif k == '#gil' then life.gil = tonumber(v)
             elseif k == '#wing' then life.wing = tonumber(v)
+            elseif k == '#discern' then life.discern = tonumber(v)
             elseif k == '#wing_approx' then life.wing_approx = tonumber(v) == 1
             else
                 -- merge names saved by older versions ("Pebble.<code>1") into the plain name
@@ -229,7 +239,7 @@ local function save_life(force)
     f:write(('#attempts\t%d\n#successes\t%d\n#fatigue\t%d\n#free\t%d\n#day\t%d\n'):format(
         life.attempts, life.successes, life.fatigue, life.free, life.day))
     for key, n in pairs(life.cur) do f:write(('#cur_%s\t%d\n'):format(key, n)) end
-    f:write(('#gil\t%d\n'):format(life.gil))
+    f:write(('#gil\t%d\n#discern\t%d\n'):format(life.gil, life.discern))
     if life.wing then
         f:write(('#wing\t%d\n#wing_approx\t%d\n'):format(life.wing, life.wing_approx and 1 or 0))
     end
@@ -388,6 +398,20 @@ end
 local function wing_delay()
     local r = wing_rank(life.wing)
     return r and r[4] or nil
+end
+
+-- Hyper Chocobo Digging Campaign: every rank digs every 3s while it runs.
+-- S.hyper: nil = not tested, true = active, false = not active
+-- hyper_test: nil, 'need_base' (waiting for a normal dig to land),
+--             'probe_next' (next dig is the test), 'probing' (test dig sent)
+local HYPER_DELAY = 3
+local hyper_test = nil
+
+-- seconds between digs auto-dig should use right now
+local function dig_delay()
+    local wd = wing_delay() or 15 -- unknown Wing Skill: assume the slowest rank to be safe
+    if S.hyper then wd = math.min(wd, HYPER_DELAY) end
+    return wd
 end
 
 local function set_wing(n, approx, quiet)
@@ -602,10 +626,13 @@ local function update_hud(now)
     local countdown = S.running and math.max(0, math.ceil(next_dig - now)) or 0
 
     local rows = {
-        row('State', state_text()),
+        row('State', state_text() .. ((S.running and anchor and settings.roam_radius > 0 and pos)
+            and (C.dim .. ('  %d/%dy from centre'):format(math.floor(dist2d(pos, anchor)), math.floor(settings.roam_radius)) .. C.r) or '')),
         row('Fatigue', f_col .. life.fatigue .. C.r .. C.dim .. (cap > 0 and (' / ' .. cap .. '  (' .. math.max(0, cap - life.fatigue) .. ' left)') or '') .. C.r),
         row('Free digs', C.good .. life.free .. C.r .. C.dim .. (' (' .. ((life.fatigue + life.free) > 0 and math.floor(life.free / (life.fatigue + life.free) * 100) or 0) .. '% today)') .. C.r),
         row('Attempts', ('%d  %s(%d hit / %d miss)%s'):format(S.attempts, C.dim, S.successes, S.fails, C.r)),
+        row('Discern', ('%d  %s(%d today, %s lifetime)%s'):format(S.discern, C.dim,
+            today().discern or 0, commas(life.discern), C.r)),
         row('Hit rate', ('%.1f%%'):format(rate)),
         row('Greens', g_col .. (greens and tostring(greens) or '?') .. C.r),
         row('Inventory', inv_text),
@@ -622,6 +649,13 @@ local function update_hud(now)
             life.wing_approx and '~' or '', life.wing, wr[1], C.dim, wr[4], C.r)))
     else
         table.insert(rows, 2, row('Wing', C.dim .. '? (//bup wing <level>)' .. C.r))
+    end
+
+    -- Hyper Chocobo Digging Campaign status (only shown when it matters)
+    if S.hyper then
+        table.insert(rows, 3, row('Hyper', C.good .. 'ACTIVE' .. C.r .. C.dim .. (' (%ds cooldown)'):format(HYPER_DELAY) .. C.r))
+    elseif hyper_test and S.running then
+        table.insert(rows, 3, row('Hyper', C.warn .. 'testing...' .. C.r))
     end
 
     -- today's totals (every session since midnight JST)
@@ -688,6 +722,7 @@ local function stop_moving()
     if moving then windower.ffxi.run(false) end
     moving, move_start_time, move_start_pos = false, 0, nil
     prog_time, prog_pos = 0, nil
+    turn_until = 0
 end
 
 local function turn_by(rad)
@@ -698,13 +733,52 @@ local function turn_by(rad)
 end
 
 local move_target = 0 -- yalms this move should cover
+local need_spin = false -- spin to a new heading before the next move
+
+-- FFXI facing: moving at facing f changes x by cos(f) and y by -sin(f)
+local function heading_to(from, to)
+    return -math.atan2(to.y - from.y, to.x - from.x)
+end
+
+-- New heading after a dig: random, unless the next spot would leave the area,
+-- in which case head back toward the centre (give or take 45 degrees).
+-- returns a heading, or nil to keep going the way you're facing
+local function roam_heading(pos)
+    local r = settings.roam_radius
+    local function rnd() return math.random() * 2 * math.pi end
+    local step = settings.required_distance + 1
+    local function fits(f)
+        if not anchor or r <= 0 then return true end
+        local nx, ny = pos.x + math.cos(f) * step, pos.y - math.sin(f) * step
+        return dist2d({x = nx, y = ny}, anchor) <= r
+    end
+    -- turn_chance % of the time pick a new heading; otherwise carry on,
+    -- unless carrying on would leave the area
+    local me = get_me()
+    if me and me.facing and math.random() * 100 >= settings.turn_chance and fits(me.facing) then
+        return nil
+    end
+    if not anchor or r <= 0 then return rnd() end
+    for _ = 1, 8 do -- try a few random headings that keep the next spot inside
+        local f = rnd()
+        local nx, ny = pos.x + math.cos(f) * step, pos.y - math.sin(f) * step
+        if dist2d({x = nx, y = ny}, anchor) <= r then return f end
+    end
+    return heading_to(pos, anchor) + (math.random() * 2 - 1) * math.pi / 4
+end
 
 -- mode: false/nil = keep heading, true = stuck (turn 90-180 degrees),
 -- 'reverse' = rough 180 (plus or minus 30 degrees) away from undiggable ground
 local function start_moving(mode, dist)
     local pos = get_pos()
     if not pos then return end
-    if mode == 'reverse' then
+    if mode == 'roam' then
+        local f = roam_heading(pos)
+        if f then
+            windower.ffxi.turn(f % (2 * math.pi))
+            turn_until = os.clock() + 0.4 -- finish turning before running
+        end
+    elseif mode == 'reverse' then
         turn_by(math.pi + (math.random() * 2 - 1) * math.pi / 6)
     elseif mode then
         local sign = math.random() < 0.5 and -1 or 1
@@ -714,7 +788,7 @@ local function start_moving(mode, dist)
     move_start_pos, move_start_time = pos, os.clock()
     prog_pos, prog_time = pos, os.clock()
     moving = true
-    windower.ffxi.run(true)
+    if os.clock() >= turn_until then windower.ffxi.run(true) end
 end
 
 local retry_here = false   -- after turning off bad ground: dig again without the full distance
@@ -744,21 +818,58 @@ local function start_addon()
     end
     if S.running then return end
     S.running, S.paused, next_dig = true, false, 0
+    anchor, need_spin = get_pos(), false -- stay around where you started
+    bad_streak = 0
     local wd = wing_delay()
+    S.hyper, hyper_test = nil, nil
+    if (wd or 15) > HYPER_DELAY then hyper_test = 'need_base' end -- campaign would speed us up: test it
     log('Started. Be mounted on your chocobo.' ..
-        (wd and (' Digging every %ds or more (Wing Skill cooldown %ds).'):format(
-            math.max(settings.dig_interval, wd), wd) or ''))
+        (wd and (' Wing Skill cooldown %ds.'):format(wd)
+            or ' Wing Skill unknown, so using the slowest cooldown (15s). Set it with //bup wing <level>.') ..
+        (hyper_test and ' Checking for a Hyper Chocobo Digging Campaign on the second dig.' or ''))
 end
 
 -- The ground here can't be dug (the game refused, or never answered):
 -- turn roughly around, go a short way, and dig again there.
+local last_ok_t = 0 -- os.clock() when the last dig that got a result was sent
+local bad_streak = 0 -- "can't dig here" in a row, reset by any real dig result
+
+-- the test dig at campaign speed got no answer: no campaign. Dig again here
+-- once the normal cooldown since the last real dig has passed.
+local function hyper_failed()
+    S.hyper, hyper_test = false, nil
+    auto_wait = nil
+    last_dig_pos = prev_dig_pos
+    retry_here = true
+    next_dig = last_ok_t + math.max(settings.dig_interval, dig_delay() + 0.5)
+    log(('No Hyper Chocobo Digging Campaign detected. Digging every %ds.'):format(dig_delay()))
+end
+
+local gave_up_spot = nil -- where we gave up waiting; used if the result turns up late
+
 local function bad_ground(why)
-    auto_wait, S.pending = nil, nil
+    if hyper_test == 'probing' then hyper_failed() return end
+    -- stop waiting, but keep S.pending: a result that turns up late
+    -- (within 12s of the dig) is still recorded
+    auto_wait = nil
+    gave_up_spot = last_dig_pos
+    bad_streak = bad_streak + 1
+    if settings.bad_ground_limit > 0 and bad_streak >= settings.bad_ground_limit then
+        local n = bad_streak
+        bad_streak = 0
+        stop_addon(('couldn\'t dig %d times in a row. Move somewhere else and press START.'):format(n))
+        -- loud alert only you see/hear: a chat call sound plus an echo line
+        windower.send_command('input /echo [BirdUp] Auto-dig stopped: ' .. n .. ' failed digs in a row. <call14>')
+        if settings.stop_echo and settings.stop_echo ~= '' then
+            windower.send_command('input /echo ' .. settings.stop_echo)
+        end
+        return
+    end
     last_dig_pos = prev_dig_pos -- that spot wasn't a real dig
     retry_here = true
-    if os.clock() - bad_ground_log > 15 then
-        bad_ground_log = os.clock()
-        log(('Can\'t dig here (%s). Turning around and trying a few yalms away.'):format(why))
+    do
+        log(('Can\'t dig here (%s). Turning around and trying a few yalms away. (%d/%d)'):format(
+            why, bad_streak, settings.bad_ground_limit))
     end
     start_moving('reverse', settings.turn_distance)
 end
@@ -767,13 +878,14 @@ local function attempt_dig()
     stop_moving()
     prev_dig_pos, last_dig_pos = last_dig_pos, get_pos()
     retry_here = false
+    need_spin = true
+    gave_up_spot = nil
     auto_wait = os.clock()
-    -- never faster than the Wing Skill cooldown, plus a little slack
-    local wd = wing_delay()
-    local base = math.max(settings.dig_interval, wd and (wd + 0.5) or 0)
-    local wait = base + (math.random() * 2 - 1) * settings.jitter
-    if wd then wait = math.max(wd + 0.3, wait) end
-    next_dig = os.clock() + wait
+    if hyper_test == 'probe_next' then hyper_test = 'probing' end
+    -- never faster than the cooldown (Wing Skill, or the campaign's), plus a little slack
+    local wd = dig_delay()
+    local wait = math.max(settings.dig_interval, wd + 0.5) + (math.random() * 2 - 1) * settings.jitter
+    next_dig = os.clock() + math.max(wd + 0.3, wait)
     windower.send_command('input /dig')
 end
 
@@ -814,9 +926,49 @@ local function count_dig()
     S.first_dig = S.first_dig or now_t
 end
 
+-- the game answered our dig: update the campaign test
+local function dig_answered()
+    if auto_wait then
+        last_ok_t = auto_wait
+    elseif gave_up_spot then
+        -- late result for a dig we'd given up on: it was a real dig after all
+        log('That dig worked after all (the result was slow). Recorded it.')
+        last_dig_pos, retry_here = gave_up_spot, false
+        last_ok_t = S.pending or os.clock()
+    end
+    gave_up_spot = nil
+    bad_streak = 0
+    settle_until = os.clock() + settings.dig_settle -- let the dig finish
+    S.pending, auto_wait = nil, nil
+    if hyper_test == 'need_base' then
+        hyper_test = 'probe_next' -- try the next dig at campaign speed
+        next_dig = last_ok_t + math.max(settings.dig_interval, HYPER_DELAY + 0.5)
+    elseif hyper_test == 'probing' then
+        S.hyper, hyper_test = true, nil
+        next_dig = last_ok_t + math.max(settings.dig_interval, HYPER_DELAY + 0.5)
+        log(('Hyper Chocobo Digging Campaign detected! Digging every %ds instead of %ds.'):format(
+            dig_delay(), wing_delay() or 15))
+    end
+end
+
+-- Discernment: the chocobo refused the greens but still digs. The game prints
+--   "Your chocobo refuses to partake of the bunch of gysahl greens."
+--   "Obtained: <item>"
+--   "It appears your chocobo found this item with ease."
+-- so this only counts the proc; the Obtained line that follows is the dig's result.
+local function record_discern()
+    roll_day()
+    S.discern = S.discern + 1
+    life.discern = life.discern + 1
+    local td = today()
+    td.discern = (td.discern or 0) + 1
+    life_dirty = true
+    save_life(false)
+end
+
 local function record(item, cur)
     roll_day()
-    S.pending, auto_wait = nil, nil
+    dig_answered()
     count_dig()
     if item then
         S.successes = S.successes + 1
@@ -907,7 +1059,7 @@ windower.register_event('incoming text', function(original)
 
     if S.running and auto_wait then
         for _, p in ipairs(BAD_GROUND_PATTERNS) do
-            if lower:find(p, 1, true) then bad_ground('game said no') return end
+            if lower:find(p, 1, true) then bad_ground('game said no') return end -- (a refused test dig = no campaign)
         end
     end
 
@@ -923,6 +1075,12 @@ windower.register_event('incoming text', function(original)
     end
 
     local pending_ok = S.pending and os.clock() - S.pending <= 12
+
+    -- Discernment proc (counted whenever seen; the item line comes next)
+    if lower:find('refuses to partake of the', 1, true) then
+        record_discern()
+        return
+    end
 
     if lower:find('you dig and you dig', 1, true) and lower:find('find nothing', 1, true) then
         if pending_ok then record(nil) end
@@ -959,11 +1117,8 @@ windower.register_event('incoming text', function(original)
     end
     if not found then return end
 
-    if pending_ok then
-        record(found, cur)
-    elseif last_find and os.clock() - last_find.t < 1.5 then
-        add_item(found, cur) -- extra item from the same dig: list it, don't add fatigue
-    end
+    -- a dig gives at most one item, so only the result of a pending dig counts
+    if pending_ok then record(found, cur) end
 end)
 
 ---------------------------------------------------------------------------
@@ -1006,6 +1161,12 @@ local function record_sale(name, qty, gil)
 end
 
 windower.register_event('outgoing chunk', function(id, data)
+    -- 0x01A action packet, category 0x11 = chocobo dig. Sent for typed /dig
+    -- AND for Dig picked from the menu, so menu digs are tracked too.
+    if id == 0x01A and #data >= 12 and u16(data, 11) == 0x11 then
+        S.pending = os.clock()
+        return
+    end
     if id == 0x084 and #data >= 11 then        -- vendor: item picked to sell
         sell_req = {count = u32(data, 5), id = u16(data, 9), t = os.clock()}
     elseif id == 0x085 and sell_req then        -- vendor: sale confirmed
@@ -1054,6 +1215,14 @@ local function tick(now)
         if windower.ffxi.get_player() and not is_mounted() then stop_addon('not mounted.') return end
     end
 
+    if moving and turn_until > 0 then
+        if now < turn_until then return end
+        turn_until = 0
+        windower.ffxi.run(true) -- turned; now go
+        move_start_time = now
+        prog_pos, prog_time = get_pos(), now
+    end
+
     if moving then
         local pos = get_pos()
         if pos and move_start_pos and dist2d(pos, move_start_pos) >= move_target then
@@ -1077,12 +1246,20 @@ local function tick(now)
         return
     end
 
+    -- let the dig animation finish before turning and moving off
+    if now < settle_until then return end
+
+    -- first move after each dig: spin to a new heading that stays in the area
+    local function go()
+        if need_spin then need_spin = false; start_moving('roam') else start_moving(false) end
+    end
+
     if now < next_dig then
-        if not can_dig_here() then start_moving(false) end
+        if not can_dig_here() then go() end
         return
     end
 
-    if can_dig_here() then attempt_dig() else start_moving(false) end
+    if can_dig_here() then attempt_dig() else go() end
 end
 
 windower.register_event('prerender', function()
@@ -1179,6 +1356,7 @@ local function switch_character()
 
     char_name = name
     S.attempts, S.successes, S.fails, S.free, S.drops, S.first_dig, S.cur, S.gil = 0, 0, 0, 0, {}, nil, {}, 0
+    S.discern = 0
     S.pending, S.last_dig_t, last_find = nil, nil, nil
     load_life()
     load_history()
@@ -1214,6 +1392,12 @@ local function help()
         'status                 - print summary to chat',
         'distance <yalms>       - distance required between digs',
         'turn <yalms>           - distance to move after turning off undiggable ground',
+        'settle <seconds>       - wait after each dig before turning and moving (default 2.5)',
+        'badlimit <n>           - stop and alert after n failed digs in a row (default 7, 0 = never)',
+        'stopecho <text>        - extra line echoed with that alert (stopecho off = none)',
+        'turnchance <0-100>     - % chance to turn after a dig instead of carrying on (default 50)',
+        'area <yalms>           - stay within this distance of where auto-dig started (0 = no limit)',
+        'anchor                 - make your current spot the centre of the digging area',
         'timer <seconds>        - base seconds between digs',
         'jitter <seconds>       - random +/- added to timer',
         'max <count>            - auto-stop after N finds (0 = off)',
@@ -1223,6 +1407,7 @@ local function help()
         'slots <n>              - auto-stop at n free inventory slots or fewer (0 = off)',
         'mount on|off           - require being mounted',
         'wing [level]           - show / set your Wing Skill (skill-ups in chat keep it updated)',
+        'hyper on|off|test      - set or re-test the Hyper Chocobo Digging Campaign (tested on every start)',
         'history [days|date]    - daily dig log (e.g. history 14, history 20261101)',
         'prices clean           - remove prices for items no character has dug up',
         'hud                    - show/hide the display',
@@ -1260,16 +1445,36 @@ windower.register_event('addon command', function(cmd, ...)
         S.paused = not S.paused
         stop_moving()
         auto_wait = nil
+        if hyper_test == 'probing' then hyper_test = 'probe_next' end
         log(S.paused and 'Paused.' or 'Resumed.')
     elseif cmd == 'reset' then
         S.attempts, S.successes, S.fails, S.free, S.drops, S.first_dig, S.cur, S.gil = 0, 0, 0, 0, {}, nil, {}, 0
+    S.discern = 0
         log('Session stats reset. (Today\'s items and daily fatigue are kept; they clear at midnight JST.)')
     elseif cmd == 'status' then
-        log(('running=%s attempts=%d finds=%d misses=%d greens=%s inventory=%s/%s'):format(
-            tostring(S.running), S.attempts, S.successes, S.fails, tostring(greens),
+        log(('running=%s attempts=%d finds=%d misses=%d discern=%d hyper=%s greens=%s inventory=%s/%s'):format(
+            tostring(S.running), S.attempts, S.successes, S.fails, S.discern, tostring(S.hyper), tostring(greens),
             tostring(inv_used), tostring(inv_max)))
     elseif cmd == 'distance' then set_num('required_distance', a[1], 'distance')
     elseif cmd == 'turn'     then set_num('turn_distance', a[1], 'turn')
+    elseif cmd == 'settle'   then set_num('dig_settle', a[1], 'settle')
+    elseif cmd == 'badlimit' then set_num('bad_ground_limit', a[1], 'badlimit')
+    elseif cmd == 'stopecho' then
+        local text = table.concat(a, ' ')
+        if text == '' then log('Alert echo: ' .. (settings.stop_echo ~= '' and settings.stop_echo or '(none)')) return end
+        settings.stop_echo = text:lower() == 'off' and '' or text
+        config.save(settings)
+        log('Alert echo: ' .. (settings.stop_echo ~= '' and settings.stop_echo or '(none)'))
+    elseif cmd == 'turnchance' then
+        local n = tonumber(a[1])
+        if not n or n < 0 or n > 100 then log('Usage: //bup turnchance <0-100>') return end
+        settings.turn_chance = n
+        config.save(settings)
+        log(('Turn chance after each dig: %d%%.'):format(n))
+    elseif cmd == 'area'     then set_num('roam_radius', a[1], 'area')
+    elseif cmd == 'anchor' then
+        anchor = get_pos()
+        log(anchor and ('Digging area centred here (%d yalm radius).'):format(settings.roam_radius) or 'Position unknown.')
     elseif cmd == 'timer'    then set_num('dig_interval', a[1], 'timer')
     elseif cmd == 'jitter'   then set_num('jitter', a[1], 'jitter')
     elseif cmd == 'max'      then set_num('max_success', a[1], 'max')
@@ -1336,6 +1541,15 @@ windower.register_event('addon command', function(cmd, ...)
         save_prices()
         log(('Removed %d price%s for items nobody has dug up%s'):format(#removed, #removed == 1 and '' or 's',
             #removed > 0 and (': ' .. table.concat(removed, ', ')) or '.'))
+    elseif cmd == 'hyper' then
+        local v = (a[1] or ''):lower()
+        if v == 'on' then S.hyper, hyper_test = true, nil
+        elseif v == 'off' then S.hyper, hyper_test = false, nil
+        elseif v == 'test' then S.hyper, hyper_test = nil, 'need_base'
+        end
+        log(('Hyper Chocobo Digging Campaign: %s. Digging every %ds.'):format(
+            hyper_test and 'will test on the next digs' or (S.hyper and 'active' or (S.hyper == false and 'not active' or 'not tested')),
+            dig_delay()))
     elseif cmd == 'wing' then
         local n = tonumber(a[1] or '')
         if n then
@@ -1363,8 +1577,8 @@ windower.register_event('addon command', function(cmd, ...)
         if one then
             local e = history[one]
             if not e then log('No digs logged on ' .. day_str(one) .. ' (JST).') return end
-            log(('%s (JST): %d finds from %d digs, %d miss, %d fatigue + %d free, %d session%s, %s digging, %s gil sold%s'):format(
-                day_str(one), e.finds, e.attempts, e.fails, e.fatigue, e.free, e.sessions,
+            log(('%s (JST): %d finds from %d digs, %d miss, %d discern, %d fatigue + %d free, %d session%s, %s digging, %s gil sold%s'):format(
+                day_str(one), e.finds, e.attempts, e.fails, e.discern or 0, e.fatigue, e.free, e.sessions,
                 e.sessions == 1 and '' or 's', fmt_time(e.secs), commas(e.gil),
                 e.wing and (', Wing Skill ' .. e.wing) or ''))
             for k, n in pairs(e.cur) do log(('  %-18s %s'):format(k == 'cp' and 'conquest points' or k, commas(n))) end

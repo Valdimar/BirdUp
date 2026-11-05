@@ -2,7 +2,7 @@
 
 A Windower 4 addon for Final Fantasy XI that automates chocobo digging and tracks everything about it: fatigue, free digs, inventory space, and every item you find. It combines the auto-dig behavior of [Velner/chocodig](https://github.com/Velner/chocodig) with dig tracking, all shown on one draggable HUD.
 
-**Author:** Valdimar @ Phoenix  **Version:** 1.6  **Commands:** `//birdup` or `//bup`
+**Author:** Valdimar @ Phoenix  **Version:** 2.3  **Commands:** `//birdup` or `//bup`
 
 > Status: untested release. Run short sessions first and watch the Windower console for Lua errors.
 
@@ -10,11 +10,13 @@ A Windower 4 addon for Final Fantasy XI that automates chocobo digging and track
 
 ## Features
 
-- **Auto-dig:** walks around the zone, digs on a timer once it has moved far enough, and turns when stuck. On ground that can't be dug, it turns roughly around, moves a few yalms and tries again.
+- **Auto-dig:** walks around the zone, digs on a timer once it has moved far enough, and turns when stuck. After each dig finishes it either carries on the same way or turns to a random new heading (50/50 by default), while staying within an area around where you started. On ground that can't be dug, it turns roughly around, moves a few yalms and tries again.
 - **Wing Skill:** reads your Wing Skill from chat and sets the dig cooldown to match (never digs faster than the game allows).
 - **Start / Stop buttons:** click them right on the panel.
 - **Daily history:** one log per Japan day, with every session that day added together.
 - **Fatigue tracker:** a bar and counter for today's fatigue-counting digs against your cap, per character, reset at midnight JST.
+- **Discernment counter:** counts the times your chocobo refuses the greens (session, today and lifetime).
+- **Hyper Campaign check:** tests for a Hyper Chocobo Digging Campaign each time auto-dig starts and digs faster if one is running.
 - **Free dig detection:** spots "found this item with ease" digs and keeps them out of your fatigue count.
 - **Inventory tracking:** used and max slots with a free count, plus auto-stop when space runs low.
 - **Currency totals:** lifetime and session totals for the conquest points (and Imperial Standing, allied notes and bayld) that dig rewards pay out.
@@ -58,10 +60,12 @@ The HUD appears automatically when you get on a chocobo and hides when you get o
 |------|---------------|
 | Title and top bar | Today's fatigue digs against your cap. The bar is green, turns amber at 70% and red at 90%. |
 | START / STOP | Buttons that start and stop auto-digging. The one that does something right now is bright. |
-| State | IDLE, DIGGING, MOVING or PAUSED. |
+| State | IDLE, DIGGING, MOVING or PAUSED. While auto-digging, also how far you are from the centre of the digging area. |
 | Wing | Your Wing Skill, its rank, and the cooldown between digs at that rank. Shows `?` until it's seen in chat or set with `//bup wing <level>`. |
 | Fatigue | Fatigue digs used, the cap, and how many are left. |
 | Free digs | Free digs today and what percentage of successful digs were free. |
+| Discern | Discernment procs (*"Your chocobo refuses to partake of the bunch of gysahl greens."*) this session, with today's and lifetime totals. |
+| Hyper | Shows `testing...` while the campaign check runs and `ACTIVE` if a campaign was found. Hidden otherwise. |
 | Attempts | Digs this session that got a result (an item, a reward or "find nothing"), with hits and misses. A `/dig` the game rejects, for example on cooldown, isn't counted. |
 | Hit rate | Successful digs as a percentage of attempts. |
 | Greens | Gysahl Greens in your inventory (red under 10). |
@@ -93,6 +97,12 @@ Use `//bup` (or `//birdup`) followed by:
 | `reset` | Reset session stats (attempts, session timer). Today's items and daily fatigue are kept. |
 | `status` | Print a summary to chat. |
 | `distance <yalms>` | Distance to travel between digs. |
+| `area <yalms>` | Radius of the digging area around where auto-dig started (default 20, 0 = no limit). |
+| `anchor` | Make your current spot the centre of the digging area. |
+| `settle <seconds>` | How long to wait after each dig result before turning and moving (default 2.5). Raise it if the chocobo starts moving mid-dig. |
+| `turnchance <0-100>` | Chance (%) to turn after each dig instead of carrying on (default 50). 0 = straight lines until the area edge, 100 = turn every time. |
+| `badlimit <n>` | Stop and alert after this many failed digs in a row (default 7, 0 = never). |
+| `stopecho <text>` | The extra line echoed with that alert. `stopecho off` for none. |
 | `turn <yalms>` | How far to move after turning away from ground that can't be dug (default 3). |
 | `timer <seconds>` | Base time between digs. |
 | `jitter <seconds>` | Random plus or minus added to the timer, so digs aren't evenly spaced. |
@@ -105,6 +115,7 @@ Use `//bup` (or `//birdup`) followed by:
 | `slots <n>` | Auto-stop when free inventory slots are at or below n (default 2, 0 = off). |
 | `mount on\|off` | Require being mounted to run. |
 | `wing` | Show your Wing Skill and dig cooldown. |
+| `hyper on\|off\|test` | Force the Hyper Campaign on or off for this run, or test again. |
 | `wing <level>` | Set your Wing Skill by hand (for example after checking it with an NPC). Skill-ups seen in chat keep raising it from there. |
 | `history` | Daily log for the last 7 days. `history 14` for 14 days. |
 | `history <yyyymmdd>` | One day in full, with every item found. `history today` works too. |
@@ -157,13 +168,36 @@ Since the March 2026 update, chocobo digging skill is called **Wing Skill**, and
 - Skill-ups are read from the game's line *"Your wing skill improved to 15!"* (confirmed in game). Other lines with "wing skill" and a level are matched too. If the number is ever wrong, set it with `//bup wing <level>`.
 - A skill-up that only says it rose by a point can't be used until BirdUp knows your starting level.
 
+### Discernment
+
+When your chocobo's Discernment procs, the game prints three lines:
+
+```
+Your chocobo refuses to partake of the bunch of gysahl greens.
+Obtained: <item>
+It appears your chocobo found this item with ease.
+```
+
+BirdUp counts the proc in the Discern row (session, today and lifetime), records the item as a normal find, and counts it as a free dig, so it adds no fatigue.
+
+### Hyper Chocobo Digging Campaign
+
+While a Hyper Chocobo Digging Campaign is running, every rank digs every 3 seconds. Each time auto-dig starts and your normal cooldown is longer than that (Wing Skill under 30, or unknown):
+
+1. The first dig goes in as normal.
+2. The second dig goes in at campaign speed (about 4 seconds later). The Hyper row shows `testing...`.
+3. If the game answers it, a campaign is running: BirdUp says so and digs at campaign speed for the rest of the run.
+4. If there's no answer, there's no campaign: BirdUp says so, waits out your normal cooldown and digs again on the same spot. This test dig isn't treated as bad ground.
+
+At Wing Skill 30 and above your cooldown is already 3 seconds, so there's nothing to test. If you don't know your Wing Skill, auto-dig assumes the slowest cooldown (15 seconds) until you set it with `//bup wing <level>`.
+
 ---
 
 ## Daily history
 
 Fatigue resets at midnight JST, so BirdUp keeps one log per Japan day. If you dig several times in a day, every session goes into that day's single log.
 
-Each day records: digs, finds, misses, fatigue and free digs, number of sessions, time spent digging, gil from vendor sales, currency rewards, your Wing Skill, and every item found. Use `//bup history` for a summary and `//bup history 20261101` for one day's items. The log is saved in `data/history_<name>.txt`.
+Each day records: digs, finds, misses, Discernment procs, fatigue and free digs, number of sessions, time spent digging, gil from vendor sales, currency rewards, your Wing Skill, and every item found. Use `//bup history` for a summary and `//bup history 20261101` for one day's items. The log is saved in `data/history_<name>.txt`.
 
 ---
 
@@ -213,16 +247,24 @@ Auto-dig stops, with a chat message saying why, when:
 - you reach your `max` find target for the session
 - you are not mounted (if `mount` is on)
 - the game reports a full inventory
+- it couldn't dig 7 times in a row (see below; this one also plays a call sound)
 
 It also changes direction when it detects it's stuck or hasn't moved in a while.
+
+### Staying in one area
+
+When auto-dig starts, the spot you're standing on becomes the centre of the digging area. After every dig, the chocobo waits for the dig to finish (`settle`, default 2.5 seconds after the result appears), then either carries on the way it was going or turns to a random heading (`turnchance`, default a 50% chance to turn), and only then starts moving to the next spot. If carrying on, or the new heading, would take the next dig outside the area (`area`, default 20 yalms), it picks another one, or heads back toward the centre if none fits. `//bup anchor` moves the centre to where you are now.
+
+The game's map grid squares (like H-8) aren't the same size in every zone, so BirdUp uses a circle around your start point instead. Set `area` to roughly the size of the grid square you want to stay in.
 
 ### Ground that can't be dug
 
 Some patches of ground can't be dug. When auto-dig hits one, it doesn't stop:
 
-1. It waits up to 5 seconds for the dig result. If the game refuses the dig, or no result arrives, it treats the spot as undiggable.
+1. It waits up to 5 seconds for the dig result. If the game refuses the dig, or no result arrives, it treats the spot as undiggable. If the result turns up late anyway (within 12 seconds of the dig), it's still recorded and the failed-dig count resets.
 2. It turns roughly 180 degrees (give or take 30), moves `turn` yalms (default 3) and digs again straight away, without needing the usual full distance.
-3. A chat line says it happened, at most once every 15 seconds.
+3. A chat line says it happened, with a count (for example `(3/7)`).
+4. After 7 failed digs in a row (`badlimit`), auto-dig stops and alerts you with a chat line, a call sound and a chocobo-flavoured echo (change it with `stopecho`), so you can move somewhere better and press **START**. Any dig that gets a result resets the count.
 
 That spot isn't counted as a dig.
 
@@ -251,6 +293,10 @@ These are in `settings.xml` and can be changed with the commands above.
 | `jitter` | 0.6 | Random plus or minus seconds on the interval. |
 | `required_distance` | 5 | Yalms (2D) to travel between digs. |
 | `move_timeout` | 8 | Seconds before a movement attempt is abandoned and it turns. |
+| `dig_settle` | 2.5 | Seconds after a dig result before turning and moving. |
+| `turn_chance` | 50 | % chance to turn after a dig. |
+| `bad_ground_limit` | 7 | Failed digs in a row before auto-dig stops and alerts you. |
+| `roam_radius` | 20 | Yalms auto-dig stays within, around where it started (0 = no limit). |
 | `turn_distance` | 3 | Yalms to move after turning away from undiggable ground. |
 | `result_timeout` | 5 | Seconds to wait for a dig result before treating the spot as undiggable. |
 | `stuck_check_time` | 1.0 | How often it checks whether you're moving. |
@@ -277,6 +323,7 @@ These are in `settings.xml` and can be changed with the commands above.
 - **Currency wording:** the reward messages come from BG-Wiki and an FFXIAH thread, not from a live client. If a total stays at zero after a cache dig, send me the exact chat line.
 - **Main inventory only:** only the main inventory is tracked, not the satchel, sack or case.
 - **English client:** result messages are matched in English.
+- **Dig tracking:** digs are spotted from the game's dig action, so both typed `/dig` and Dig from the menu are tracked. A dig gives at most one item; `Obtained:` lines that aren't the result of a dig are ignored.
 - **Text layout:** if lines overlap or look too far apart at your font size, adjust with `//bup spacing`.
 
 ## Troubleshooting
