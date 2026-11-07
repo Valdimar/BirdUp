@@ -1,0 +1,5 @@
+20261102	65	23	0	23	0	3	776	219	14	cp=735	Insect Wing=5|Bone Chip=3|Little Worm=6|Rock Salt=1|Pebble=4|Lizard Molt=2|Conquest Points=2	0
+20261105	267	100	167	100	0	1	2359	591	19	cp=2510	Little Worm=27|Insect Wing=10|Bone Chip=10|Lizard Molt=10|Rock Salt=8|Pebble=26|Bird Feather=3|Conquest Points=6	0
+20261106	268	100	168	100	0	2	2337	639	22	cp=4155	Mtl. Beastcoin=2|Little Worm=24|Rock Salt=6|Conquest Points=9|Insect Wing=9|Bone Chip=12|Lizard Molt=12|Pebble=25|Bird Feather=1	0
+20261107	269	100	169	100	0	1	2380	867	25	cp=2585	Mtl. Beastcoin=1|Little Worm=19|Rock Salt=6|Conquest Points=6|Insect Wing=12|Bone Chip=20|Lizard Molt=12|Pebble=21|Bird Feather=2|Grain Seeds=1	0
+20261108	104	42	62	42	0	1	875	0	26	cp=3050	Insect Wing=4|Mtl. Beastcoin=1|Little Worm=10|Bone Chip=8|Pebble=10|Lizard Molt=2|Conquest Points=7	0
