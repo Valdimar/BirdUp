@@ -4,8 +4,6 @@ A Windower 4 addon for Final Fantasy XI that automates chocobo digging and track
 
 **Author:** Valdimar @ Phoenix  **Version:** 4.0  **Commands:** `//birdup` or `//bup`
 
-> Status: untested release. Run short sessions first and watch the Windower console for Lua errors.
-
 ---
 
 ## Features
