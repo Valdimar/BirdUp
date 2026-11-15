@@ -1,7 +1,15 @@
 _addon.name     = 'birdup'
 _addon.author   = 'Valdimar @ Phoenix' -- auto-dig based on Velner/chocodig
-_addon.version  = '3.8'
+_addon.version  = '3.9'
 _addon.commands = {'birdup', 'bup'}
+
+-- Says in chat when a newer version is on GitHub (once per load; see update_check.lua)
+require('update_check').start({
+    name    = 'BirdUp',
+    version = _addon.version,
+    url     = 'https://raw.githubusercontent.com/Valdimar/BirdUp/main/birdup/birdup.lua',
+    page    = 'github.com/Valdimar/BirdUp',
+})
 
 --[[
 BirdUp: chocobo digging tracker and auto-digger for Windower 4.

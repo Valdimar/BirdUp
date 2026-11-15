@@ -2,7 +2,7 @@
 
 A Windower 4 addon for Final Fantasy XI that automates chocobo digging and tracks everything about it: fatigue, free digs, inventory space, and every item you find. It combines the auto-dig behavior of [Velner/chocodig](https://github.com/Velner/chocodig) with dig tracking, all shown on one draggable HUD.
 
-**Author:** Valdimar @ Phoenix  **Version:** 3.8  **Commands:** `//birdup` or `//bup`
+**Author:** Valdimar @ Phoenix  **Version:** 3.9  **Commands:** `//birdup` or `//bup`
 
 > Status: untested release. Run short sessions first and watch the Windower console for Lua errors.
 
@@ -53,6 +53,18 @@ A Windower 4 addon for Final Fantasy XI that automates chocobo digging and track
    ```
    lua load birdup
    ```
+
+## Update check
+
+A few seconds after you log in, BirdUp checks GitHub once for a newer version. If there is one,
+chat says so:
+
+```
+[BirdUp] Version X.Y is out (you have 3.9). Get it from github.com/Valdimar/BirdUp
+```
+
+It only speaks up when GitHub has a newer version, and stays quiet if GitHub can't be reached.
+The game can pause for a moment while it checks (at most 3 seconds, usually much less).
 
 ## Quick start
 
