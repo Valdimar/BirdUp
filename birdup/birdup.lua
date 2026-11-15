@@ -1,8 +1,39 @@
 _addon.name     = 'birdup'
 _addon.author   = 'Valdimar @ Phoenix' -- auto-dig based on Velner/chocodig
-_addon.version  = '2.9'
+_addon.version  = '3.8'
 _addon.commands = {'birdup', 'bup'}
 
+--[[
+BirdUp: chocobo digging tracker and auto-digger for Windower 4.
+
+Files:
+  birdup.lua        this file: panel, auto-dig, dig tracking, prices, history, commands
+  birdup_zones.lua  per-zone drop stats, import/export sharing
+  birdup_roe.lua    Records of Eminence progress
+
+How it fits together:
+  * Chat lines (incoming text) tell BirdUp what each dig produced. A dig is
+    "waiting" from the moment /dig or the dig packet goes out until its result
+    line arrives (results come about 4 seconds later, at the end of the dig
+    animation).
+  * Every frame (prerender) checks the date, counts greens, redraws the panel,
+    and runs tick(), the auto-dig step: wait for the result, move to the next
+    spot, wait out the cooldown, dig again.
+  * Everything per character is saved under data/ (settings.xml, lifetime_,
+    history_, zones_ files); prices, imports and the sharing id are shared.
+
+Sections, in order: Settings, State, Helpers, Debug log, Lifetime stats,
+Daily history, Item prices, Wing Skill / Hyper Campaign, Panel (HUD),
+Movement, Result tracking, Sale detection, Main loop, Per-character support,
+Mouse, Commands.
+
+Note: Windower runs LuaJIT, which allows at most 200 local variables at the
+top of a file and 60 outside variables per function. That's why constants
+live in the K table, related helpers are grouped into tables (SETTINGS,
+debug_unknown), and each //bup command is its own small function.
+]]
+
+-- Windower libraries: on-screen text, images, saved settings, game data
 local texts  = require('texts')
 local images = require('images')
 local config = require('config')
@@ -11,25 +42,33 @@ local res    = require('resources')
 ---------------------------------------------------------------------------
 -- Settings
 ---------------------------------------------------------------------------
+package.path = windower.addon_path .. '?.lua;' .. package.path -- find birdup_*.lua next to this file
+local K = {} -- constants (kept in one table: Lua allows only 200 top-level locals)
+
+-- Default settings. Saved per character in data/settings.xml; change them
+-- with //bup set (see SETTINGS further down).
 local defaults = {
-    dig_interval      = 4,     -- seconds between digs
-    jitter            = 0.6,   -- +/- random seconds added to the interval
+    dig_interval      = 4,     -- (no longer used: the Wing Skill cooldown sets the pace)
+    extra_wait        = 0,     -- extra seconds on top of the dig cooldown (//bup timer)
+    jitter            = 0.6,   -- up to this many random seconds added, so digs aren't perfectly regular
     required_distance = 5,     -- yalms (2D) to travel between digs
     move_timeout      = 8,
     turn_distance     = 3,     -- yalms to move after turning away from undiggable ground
-    dig_settle        = 2.5,   -- seconds to let the dig animation finish before turning and moving
+    dig_settle        = 2.5,   -- (no longer used: the dig result means the dig has finished)
+    result_buffer     = 0.3,   -- seconds after a dig result before turning and moving (//bup settle)
     turn_chance       = 50,    -- % chance to turn after a dig (otherwise keep going the same way)
     roam_radius       = 20,    -- stay within this many yalms of where auto-dig started (0 = no limit)
+    stop_settle       = 0.4,   -- seconds the chocobo must be standing still before a dig
     result_timeout    = 5,     -- used until auto_tune has enough measurements
     auto_tune         = true,  -- set the no-result wait from how fast results really arrive
     warn_greens       = 10,    -- flash the panel when greens are at or below this (0 = off)
     warn_slots        = 5,     -- flash the panel when free inventory slots are at or below this (0 = off)
-    blocked_progress  = 1.0,   -- yalms a second below which the chocobo counts as blocked (walls)
+    blocked_progress  = 1.0,   -- yalms a second below which the chocobo always counts as blocked (walls)
     bad_ground_limit  = 7,     -- stop and alert after this many "can't dig here" in a row (0 = never)
-    stop_echo         = 'Kweh! This ground is all wark and no dig. Find me a better spot!', -- extra echo with the alert     -- seconds to wait for a dig result before treating the spot as undiggable
+    stop_echo         = 'Kweh! This ground is all wark and no dig. Find me a better spot!', -- extra echo with the alert
     stuck_check_time  = 1.0,
     stuck_epsilon     = 0.2,
-    max_success       = 100,   -- 0 = never auto-stop on count
+    max_success       = 100,   -- stop after this many finds today (0 = never)
     require_mount     = true,
     hud_visible       = true,
     auto_hide         = true,
@@ -46,15 +85,17 @@ local defaults = {
     min_free_slots    = 2,     -- auto-stop when free inventory slots <= this (0 = off)
     pos               = {x = 1100, y = 200},
 }
+-- the current character's settings (reloaded on character change)
 local settings = config.load(defaults)
 
-local GREENS_ID   = 4545
+K.GREENS_ID   = 4545
 -- player.status while riding: 5 = chocobo (rental/whistle), 85 = mount system
-local MOUNT_STATUSES = {[5] = true, [85] = true}
+K.MOUNT_STATUSES = {[5] = true, [85] = true}
 
+-- true while riding a chocobo (or any mount: the game can't tell them apart)
 local function is_mounted()
     local p = windower.ffxi.get_player()
-    return p and MOUNT_STATUSES[p.status] or false
+    return p and K.MOUNT_STATUSES[p.status] or false
 end
 
 ---------------------------------------------------------------------------
@@ -67,16 +108,23 @@ local S = {
     first_dig = nil,          -- os.time() of first attempt this session
     pending = nil,            -- os.clock() of last /dig, awaiting a result
 }
+-- this character's lifetime totals plus today's fatigue (data/lifetime_<name>.txt)
 local life = {attempts = 0, successes = 0, drops = {}, fatigue = 0, free = 0, day = 0, cur = {}, gil = 0, wing = nil, wing_approx = false, discern = 0}
+-- unsaved changes? / when lifetime was last saved
 local life_dirty, life_saved = false, 0
 
+-- earliest time for the next dig / where the last dig was
 local next_dig, last_dig_pos = 0, nil
-local anchor = nil -- {x, y}: centre of the area auto-dig stays in
+local anchor = nil -- {x, y}: center of the area auto-dig stays in
 local settle_until = 0 -- don't turn or move before this (dig animation still playing)
 local turn_until = 0   -- after turning, wait this long before starting to run
+-- auto-dig movement: running?, when and where this move started
 local moving, move_start_time, move_start_pos = false, 0, nil
+-- last progress check (for spotting walls)
 local prog_time, prog_pos = 0, nil
+-- Gysahl Greens in your bag / when last counted
 local greens, greens_time = nil, 0
+-- inventory slots used / total
 local inv_used, inv_max = nil, nil
 
 ---------------------------------------------------------------------------
@@ -93,6 +141,7 @@ local function escape(str)
     return (tostring(str):gsub('[%z\1-\31\127-\255]', function(c) return ('<%02X>'):format(c:byte()) end))
 end
 
+-- write one timestamped line to the debug log (does nothing while debug is off)
 local function dbg(kind, msg)
     if not debug_f then return end
     local t = os.clock()
@@ -100,11 +149,52 @@ local function dbg(kind, msg)
     debug_f:flush()
 end
 
+-- BirdUp's chat line ([BirdUp] ...), also copied to the debug log
 local function log(msg)
     windower.add_to_chat(207, ('[BirdUp] %s'):format(msg))
     dbg('BIRDUP', msg)
 end
 
+-- Game lines seen near digs that BirdUp has no rule for, listed at the end of
+-- each debug log so new messages are easy to spot.
+local debug_unknown = {
+    lines = {},
+    known = {'obtained:', 'find nothing', 'refuses to partake', 'with ease', 'wing skill',
+             'cannot dig here', 'wait longer to perform', 'cache of beastman', 'records of eminence',
+             'progress:', 'sparks of eminence', 'unity accolades', 'limit points', 'experience points',
+             'objective may be repeated', 'bayld', 'imperial standing', 'allied notes', 'conquest points',
+             'inventory is full', 'cannot carry any more'},
+    -- player chat (say, shout, tell, party, linkshells, unity...) isn't the game talking
+    player_modes = {[1]=1, [2]=1, [3]=1, [4]=1, [5]=1, [6]=1, [7]=1, [8]=1, [9]=1, [10]=1, [11]=1,
+                    [12]=1, [13]=1, [14]=1, [15]=1, [211]=1, [212]=1, [213]=1, [214]=1, [220]=1},
+}
+-- remember a game line near a dig that matches none of BirdUp's rules
+function debug_unknown.note(clean, mode)
+    if debug_unknown.player_modes[mode] then return end
+    local lower = clean:lower()
+    for _, k in ipairs(debug_unknown.known) do if lower:find(k, 1, true) then return end end
+    local shape = clean:gsub('%d+', '#'):gsub('%s+$', '')
+    if shape == '' or shape:find('[BirdUp]', 1, true) then return end
+    debug_unknown.lines[shape] = (debug_unknown.lines[shape] or 0) + 1
+end
+-- close the debug log, ending it with the unrecognized-lines list;
+-- returns how many unrecognized lines there were
+function debug_unknown.close(why)
+    if not debug_f then return end
+    local list = {}
+    for line, n in pairs(debug_unknown.lines) do list[#list + 1] = {line, n} end
+    table.sort(list, function(x, y) return x[2] > y[2] end)
+    debug_f:write('\n---- Lines near digs BirdUp has no rule for (numbers shown as #) ----\n')
+    if #list == 0 then debug_f:write('(none)\n') end
+    for _, e in ipairs(list) do debug_f:write(('%5dx  %s\n'):format(e[2], escape(e[1]))) end
+    dbg('END', why)
+    debug_f:close()
+    debug_f = nil
+    debug_unknown.lines = {}
+    return #list
+end
+
+-- 1234567 -> '1,234,567'
 local function commas(n)
     local s = tostring(math.floor(n))
     local k
@@ -127,6 +217,7 @@ local function short_price(n)
     return half(n / 1000000) .. 'm'
 end
 
+-- seconds -> 'hh:mm:ss' (session timer, history)
 local function fmt_time(sec)
     sec = math.max(0, math.floor(sec))
     return ('%02d:%02d:%02d'):format(math.floor(sec / 3600), math.floor(sec / 60) % 60, sec % 60)
@@ -140,19 +231,23 @@ local function fmt_short(sec)
     return ('%dh%02dm'):format(math.floor(sec / 3600), math.floor(sec / 60) % 60)
 end
 
+-- your own character as Windower sees it (position, facing...)
 local function get_me() return windower.ffxi.get_mob_by_target('me') end
 
+-- your current x/y position, or nil before you've logged in
 local function get_pos()
     local me = get_me()
     return me and {x = me.x, y = me.y} or nil
 end
 
+-- flat distance in yalms between two positions (height ignored)
 local function dist2d(a, b)
     if not a or not b then return 0 end
     local dx, dy = a.x - b.x, a.y - b.y
     return math.sqrt(dx * dx + dy * dy)
 end
 
+-- count Gysahl Greens and used/max inventory slots (at most once a second)
 local function refresh_greens(now)
     if now - greens_time < 1 then return end
     greens_time = now
@@ -162,7 +257,7 @@ local function refresh_greens(now)
     local n = 0
     for i = 1, (items.inventory.max or 80) do
         local e = items.inventory[i]
-        if e and e.id == GREENS_ID then n = n + (e.count or 0) end
+        if e and e.id == K.GREENS_ID then n = n + (e.count or 0) end
     end
     greens = n
 end
@@ -173,7 +268,8 @@ end
 local char_name = nil -- set by switch_character() below
 local clean_name      -- defined in the prices section below
 local save_history    -- defined just below
-local save_zone_stats -- defined after the Wing Skill section
+local Z               -- zone stats + sharing module (birdup_zones.lua)
+local ROE             -- Records of Eminence module (birdup_roe.lua)
 
 ---------------------------------------------------------------------------
 -- Daily history: one entry per Japan day (fatigue resets at midnight JST).
@@ -182,16 +278,19 @@ local save_zone_stats -- defined after the Wing Skill section
 ---------------------------------------------------------------------------
 local history = {} -- yyyymmdd (JST) -> entry
 
+-- an empty daily-history entry
 local function new_day_entry()
     return {attempts = 0, finds = 0, fails = 0, fatigue = 0, free = 0, sessions = 0,
-            secs = 0, gil = 0, wing = nil, discern = 0, cur = {}, drops = {}}
+            secs = 0, gil = 0, wing = nil, discern = 0, roe = 0, cur = {}, drops = {}}
 end
 
+-- data/history_<name>.txt for the current character
 local function history_path()
     local who = (char_name or 'unknown'):lower():gsub('[^%w_-]', '')
     return windower.addon_path .. 'data/history_' .. who .. '.txt'
 end
 
+-- read this character's daily history (one tab-separated line per JST day)
 local function load_history()
     history = {}
     local f = io.open(history_path(), 'r')
@@ -208,12 +307,14 @@ local function load_history()
             for k, n in (p[11] or ''):gmatch('([^=|]+)=(%d+)') do e.cur[k] = tonumber(n) end
             for k, n in (p[12] or ''):gmatch('([^=|]+)=(%d+)') do e.drops[k] = tonumber(n) end
             e.discern = tonumber(p[13]) or 0
+            e.roe = tonumber(p[14]) or 0
             history[d] = e
         end
     end
     f:close()
 end
 
+-- write the whole daily history back, oldest day first
 save_history = function()
     windower.create_dir(windower.addon_path .. 'data')
     local f = io.open(history_path(), 'w')
@@ -226,18 +327,21 @@ save_history = function()
         local cur, drops = {}, {}
         for k, n in pairs(e.cur) do cur[#cur + 1] = k .. '=' .. n end
         for k, n in pairs(e.drops) do drops[#drops + 1] = k .. '=' .. n end
-        f:write(('%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%s\t%s\t%s\t%d\n'):format(
+        f:write(('%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%s\t%s\t%s\t%d\t%d\n'):format(
             d, e.attempts, e.finds, e.fails, e.fatigue, e.free, e.sessions, e.secs, e.gil,
-            e.wing and tostring(e.wing) or '', table.concat(cur, '|'), table.concat(drops, '|'), e.discern or 0))
+            e.wing and tostring(e.wing) or '', table.concat(cur, '|'), table.concat(drops, '|'), e.discern or 0, e.roe or 0))
     end
     f:close()
 end
 
+-- data/lifetime_<name>.txt for the current character
 local function life_path()
     local who = (char_name or 'unknown'):lower():gsub('[^%w_-]', '')
     return windower.addon_path .. 'data/lifetime_' .. who .. '.txt'
 end
 
+-- read this character's lifetime totals: '#key' lines are counters, the rest
+-- are item counts. Item names saved by older versions are cleaned up here.
 local function load_life()
     life = {attempts = 0, successes = 0, drops = {}, fatigue = 0, free = 0, day = 0, cur = {}, gil = 0,
             wing = nil, wing_approx = false, discern = 0}
@@ -268,6 +372,8 @@ local function load_life()
     f:close()
 end
 
+-- save lifetime totals (and history + zone stats with them). Without force it
+-- only saves when something changed and 30 seconds have passed.
 local function save_life(force)
     if not life_dirty then return end
     if not force and os.clock() - life_saved < 30 then return end
@@ -284,7 +390,7 @@ local function save_life(force)
     for name, n in pairs(life.drops) do f:write(('%s\t%d\n'):format(name, n)) end
     f:close()
     save_history()
-    if save_zone_stats then save_zone_stats() end
+    if Z then Z.save() end
     life_dirty, life_saved = false, os.clock()
 end
 
@@ -294,10 +400,14 @@ end
 ---------------------------------------------------------------------------
 -- Item prices (shared by all characters, learned from your own sales)
 ---------------------------------------------------------------------------
-local prices = {}                       -- item name -> gil each
+local prices = {}                       -- item name -> gil each (best known city price)
+local cprices = {}                      -- item name -> city -> gil each (latest sale there)
+-- best known vendor price per item, shared by all characters
 local prices_path = windower.addon_path .. 'data/prices.txt'
 local name_to_id, dug_by_id = nil, {}   -- dug_by_id: item id -> name (items you've dug up)
 
+-- item id for an item name (case-insensitive), using the game's short names
+-- first and long names as a fallback. The lookup table is built on first use.
 local function item_id_for(name)
     if not name_to_id then -- built once, on first use
         name_to_id = {}
@@ -333,14 +443,22 @@ function clean_name(s) -- assigns the local declared above
     return s
 end
 
+-- write prices.txt (best price per item) and city_prices.txt (per city)
 local function save_prices()
     windower.create_dir(windower.addon_path .. 'data')
     local f = io.open(prices_path, 'w')
     if not f then return end
     for name, n in pairs(prices) do f:write(('%s\t%d\n'):format(name, n)) end
     f:close()
+    f = io.open((windower.addon_path .. 'data/city_prices.txt'), 'w')
+    if not f then return end
+    for name, cities in pairs(cprices) do
+        for city, n in pairs(cities) do f:write(('%s\t%s\t%d\n'):format(name, city, n)) end
+    end
+    f:close()
 end
 
+-- read both price files, cleaning up names saved by older versions
 local function load_prices()
     prices = {}
     local changed = false
@@ -355,9 +473,23 @@ local function load_prices()
         end
     end
     f:close()
+    cprices = {}
+    local cf = io.open((windower.addon_path .. 'data/city_prices.txt'), 'r')
+    if cf then
+        for line in cf:lines() do
+            local k, city, v = line:match('^(.-)\t(.-)\t(%d+)$')
+            if k then
+                local name = clean_name(k) or k
+                cprices[name] = cprices[name] or {}
+                cprices[name][city] = tonumber(v)
+            end
+        end
+        cf:close()
+    end
     if changed then save_prices() end -- tidy names saved by older versions
 end
 
+-- remember an item's id as 'dug up', so vendor sales of it are recognized
 local function register_dug(name)
     local id = item_id_for(name)
     if id then dug_by_id[id] = name end
@@ -384,6 +516,7 @@ local function all_dug_names()
     return dug
 end
 
+-- gil value of a set of items at the best known prices (Est. val)
 local function value_of(drops)
     local total = 0
     for name, n in pairs(drops) do
@@ -401,7 +534,13 @@ local function roll_day()
         local was_set = life.day and life.day > 0
         life.day, life.fatigue, life.free = d, 0, 0
         life_dirty = true
-        if was_set and char_name then log('New day in Japan: daily fatigue reset to 0.') end
+        if was_set and char_name then
+            -- a new day also starts a new session: attempts, hit rate, the
+            -- session timer and finds-per-hour start over (auto-dig keeps running)
+            S.attempts, S.successes, S.fails, S.free, S.discern = 0, 0, 0, 0, 0
+            S.drops, S.cur, S.gil, S.first_dig, S.last_dig_t = {}, {}, 0, nil, nil
+            log('New day in Japan: daily fatigue and today\'s finds reset to 0, new session started.')
+        end
     end
 end
 
@@ -421,17 +560,18 @@ end
 -- Wing Skill (chocobo digging skill, March 2026 update) -> dig cooldown
 -- Source: BG-Wiki "Wing Skill" / "Chocobo Digging"
 ---------------------------------------------------------------------------
-local WING_RANKS = { -- {name, min skill, area delay after zoning, dig delay}
+K.WING_RANKS = { -- {name, min skill, area delay after zoning, dig delay}
     {'Amateur',     0, 60, 15}, {'Recruit',   10, 55, 10}, {'Initiate',  20, 50, 5},
     {'Novice',     30, 45,  3}, {'Apprentice', 40, 40, 3}, {'Journeyman', 50, 35, 3},
     {'Craftsman',  60, 30,  3}, {'Artisan',   70, 25,  3}, {'Adept',     80, 20, 3},
     {'Veteran',    90, 15,  3}, {'Expert',   100, 10,  3},
 }
 
+-- the rank row for a Wing Skill level: {name, min level, area delay, dig delay}
 local function wing_rank(skill)
     if not skill then return nil end
-    local r = WING_RANKS[1]
-    for _, w in ipairs(WING_RANKS) do if skill >= w[2] then r = w end end
+    local r = K.WING_RANKS[1]
+    for _, w in ipairs(K.WING_RANKS) do if skill >= w[2] then r = w end end
     return r
 end
 
@@ -442,238 +582,47 @@ local function wing_delay()
 end
 
 ---------------------------------------------------------------------------
--- Per-zone drop stats, split by Wing rank (drop tables differ by rank).
--- Each character keeps data/zones_<name>.txt; //bup export combines every
--- character's file into one shareable report + CSV.
+-- The two helper files. Each gets a small table of what it needs from here;
+-- they're wrapped in functions so the files always see the current values.
 ---------------------------------------------------------------------------
-local zstats = {} -- zone id -> rank name -> {digs, finds, miss, discern, items = {}}
+-- Records of Eminence (birdup_roe.lua): needs chat output, number formatting,
+-- and today's history entry (to count completions per day)
+ROE = require('birdup_roe')({
+    log = function(m) log(m) end,
+    commas = function(n) return commas(n) end,
+    today = function() return today() end,
+})
 
-local function zones_path(who)
-    who = (who or char_name or 'unknown'):lower():gsub('[^%w_-]', '')
-    return windower.addon_path .. 'data/zones_' .. who .. '.txt'
-end
-
-local function current_zone()
-    local info = windower.ffxi.get_info()
-    return info and info.zone or nil
-end
-
-local function zone_name(id)
-    local z = id and res.zones and res.zones[id]
-    return z and z.en or ('Zone ' .. tostring(id))
-end
-
-local function new_zone_entry() return {digs = 0, finds = 0, miss = 0, discern = 0, items = {}} end
-
-local function read_zone_file(path, into)
-    local f = io.open(path, 'r')
-    if not f then return end
-    for line in f:lines() do
-        local zid, rank, key, n = line:match('^(%d+)\t([^\t]+)\t([^\t]+)\t(%d+)$')
-        if zid then
-            zid, n = tonumber(zid), tonumber(n)
-            into[zid] = into[zid] or {}
-            local e = into[zid][rank] or new_zone_entry()
-            into[zid][rank] = e
-            if key == '#digs' then e.digs = e.digs + n
-            elseif key == '#finds' then e.finds = e.finds + n
-            elseif key == '#miss' then e.miss = e.miss + n
-            elseif key == '#discern' then e.discern = e.discern + n
-            else e.items[key] = (e.items[key] or 0) + n end
-        end
-    end
-    f:close()
-end
-
-local function load_zone_stats()
-    zstats = {}
-    read_zone_file(zones_path(), zstats)
-end
-
-save_zone_stats = function()
-    if not char_name then return end
-    windower.create_dir(windower.addon_path .. 'data')
-    local f = io.open(zones_path(), 'w')
-    if not f then return end
-    for zid, ranks in pairs(zstats) do
-        for rank, e in pairs(ranks) do
-            f:write(('%d\t%s\t#digs\t%d\n%d\t%s\t#finds\t%d\n%d\t%s\t#miss\t%d\n%d\t%s\t#discern\t%d\n'):format(
-                zid, rank, e.digs, zid, rank, e.finds, zid, rank, e.miss, zid, rank, e.discern))
-            for item, n in pairs(e.items) do f:write(('%d\t%s\t%s\t%d\n'):format(zid, rank, item, n)) end
-        end
-    end
-    f:close()
-end
-
--- entry for where you are now, at your current Wing rank
-local function zone_entry()
-    local zid = current_zone()
-    if not zid then return nil end
-    local r = wing_rank(life.wing)
-    local rank = r and r[1] or 'Unknown'
-    zstats[zid] = zstats[zid] or {}
-    zstats[zid][rank] = zstats[zid][rank] or new_zone_entry()
-    return zstats[zid][rank]
-end
-
----------------------------------------------------------------------------
--- Sharing: each install has a random id that goes into its exports, so an
--- import can tell players apart. Every imported player is kept in its own
--- file (data/community/<id>.txt); importing a newer export from the same
--- player replaces the old one instead of adding to it. Your own export is
--- never imported. "All players" = your stats + everyone imported.
----------------------------------------------------------------------------
-local my_id = nil
-local cstats = {} -- imported players combined: zone id -> rank -> entry
-
-local function get_my_id()
-    if my_id then return my_id end
-    local path = windower.addon_path .. 'data/id.txt'
-    local f = io.open(path, 'r')
-    if f then my_id = (f:read('*l') or ''):match('^(%x+)$'); f:close() end
-    if not my_id then
-        local addr = tonumber((tostring({}):match('(%x+)$')) or '0', 16) or 0
-        math.randomseed(os.time() + math.floor(os.clock() * 1000) + addr % 1000003 + #(char_name or '') * 7919)
-        my_id = ('%08x'):format(math.random(0, 0x7fffffff))
-        windower.create_dir(windower.addon_path .. 'data')
-        f = io.open(path, 'w')
-        if f then f:write(my_id .. '\n'); f:close() end
-    end
-    return my_id
-end
-
-local function community_dir() return windower.addon_path .. 'data/community/' end
-
-local function load_community()
-    cstats = {}
-    for _, file in ipairs(windower.get_dir(community_dir()) or {}) do
-        if file:match('%.txt$') then read_zone_file(community_dir() .. file, cstats) end
-    end
-end
-
-local zone_ids_by_name = nil
-local function zone_id_for(name)
-    if not zone_ids_by_name then
-        zone_ids_by_name = {}
-        for id, z in pairs(res.zones or {}) do if z.en then zone_ids_by_name[z.en:lower()] = id end end
-    end
-    return zone_ids_by_name[(name or ''):lower()]
-end
-
--- split one CSV line (handles "quoted, fields" and "" escapes)
-local function csv_fields(line)
-    local out, i, n = {}, 1, #line
-    while i <= n + 1 do
-        if line:sub(i, i) == '"' then
-            local val, j = '', i + 1
-            while j <= n do
-                local c = line:sub(j, j)
-                if c == '"' then
-                    if line:sub(j + 1, j + 1) == '"' then val = val .. '"'; j = j + 2
-                    else j = j + 1; break end
-                else val = val .. c; j = j + 1 end
-            end
-            out[#out + 1] = val
-            i = j + 1 -- skip the comma
-        else
-            local k = line:find(',', i, true) or (n + 1)
-            out[#out + 1] = line:sub(i, k - 1)
-            i = k + 1
-        end
-    end
-    return out
-end
-
--- returns ok, message
-local function import_file(path, label)
-    local f = io.open(path, 'r')
-    if not f then return false, 'could not open ' .. label end
-    local data, src, rows_read, skipped = {}, nil, 0, 0
-    local first = true
-    for line in f:lines() do
-        line = line:gsub('\r$', '')
-        if first then
-            first = false
-            if not line:match('^zone,wing_rank') then f:close(); return false, label .. " isn't a BirdUp export" end
-        elseif line ~= '' then
-            local c = csv_fields(line)
-            local zid = zone_id_for(c[1])
-            local digs, cnt = tonumber(c[3]), tonumber(c[8])
-            if zid and c[2] and digs and c[7] and cnt then
-                src = src or c[11]
-                data[zid] = data[zid] or {}
-                local e = data[zid][c[2]]
-                if not e then
-                    e = new_zone_entry()
-                    e.digs, e.finds = digs, tonumber(c[4]) or 0
-                    e.miss, e.discern = tonumber(c[5]) or 0, tonumber(c[6]) or 0
-                    data[zid][c[2]] = e
-                end
-                e.items[c[7]] = cnt
-                rows_read = rows_read + 1
-            else
-                skipped = skipped + 1
-            end
-        end
-    end
-    f:close()
-    if rows_read == 0 then return false, label .. ' had no drop rows' end
-    if src == get_my_id() then return false, label .. ' is your own export (already in your stats)' end
-    -- older exports have no id: use the file name so re-importing it replaces
-    src = (src and src ~= '') and src or ('file_' .. label:gsub('[^%w_-]', '_'))
-    windower.create_dir(windower.addon_path .. 'data')
-    windower.create_dir(community_dir())
-    local replaced = io.open(community_dir() .. src .. '.txt', 'r')
-    if replaced then replaced:close() end
-    local out = io.open(community_dir() .. src .. '.txt', 'w')
-    if not out then return false, 'could not save ' .. label end
-    local digs = 0
-    for zid, ranks in pairs(data) do
-        for rank, e in pairs(ranks) do
-            digs = digs + e.digs
-            out:write(('%d\t%s\t#digs\t%d\n%d\t%s\t#finds\t%d\n%d\t%s\t#miss\t%d\n%d\t%s\t#discern\t%d\n'):format(
-                zid, rank, e.digs, zid, rank, e.finds, zid, rank, e.miss, zid, rank, e.discern))
-            for item, n in pairs(e.items) do out:write(('%d\t%s\t%s\t%d\n'):format(zid, rank, item, n)) end
-        end
-    end
-    out:close()
-    return true, ('%s: %s digs from player %s%s'):format(label, commas(digs), src,
-        replaced and ' (replaced their older import)' or '')
-end
-
--- your entry plus every imported player's, for one zone and rank
-local function combined_entry(zid, rank)
-    local mine = zstats[zid] and zstats[zid][rank]
-    local theirs = cstats[zid] and cstats[zid][rank]
-    if not theirs then return nil end
-    local e = new_zone_entry()
-    for _, src in ipairs({mine, theirs}) do
-        if src then
-            e.digs, e.finds = e.digs + src.digs, e.finds + src.finds
-            e.miss, e.discern = e.miss + src.miss, e.discern + src.discern
-            for item, n in pairs(src.items) do e.items[item] = (e.items[item] or 0) + n end
-        end
-    end
-    return e
-end
+-- Zone stats and sharing (birdup_zones.lua): needs the character name (for
+-- file names), the current Wing rank name (stats are split by rank), and
+-- number formatting
+Z = require('birdup_zones')({
+    char_name = function() return char_name end,
+    rank_name = function() local r = wing_rank(life.wing) return r and r[1] or 'Unknown' end,
+    commas = function(n) return commas(n) end,
+})
 
 -- Hyper Chocobo Digging Campaign: every rank digs every 3s while it runs.
 -- S.hyper: nil = not tested, true = active, false = not active
 -- hyper_test: nil, 'need_base' (waiting for a normal dig to land),
 --             'probe_next' (next dig is the test), 'probing' (test dig sent)
-local HYPER_DELAY = 3
-local HYPER_AREA_DELAY = 5
+K.HYPER_DELAY = 3
+K.HYPER_AREA_DELAY = 5
+-- campaign test progress: nil, 'need_base', 'probe_next' or 'probing'
 local hyper_test = nil
 local hyper_mode = 'auto' -- 'auto' = test on each start; 'on'/'off' = set by //bup hyper (until reload)
 local zoned_at = nil      -- os.clock() of the last zone-in
 
 -- Hyper Campaign dates entered with //bup hyper Oct16-Nov9 (checked against the Japan date)
-local MONTHS = {'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'}
+K.MONTHS = {'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'}
 
+-- today's date in Japan as yyyymmdd (fatigue and campaigns follow Japan time)
 local function jst_today() return tonumber(os.date('!%Y%m%d', os.time() + 9 * 3600)) end
 
-local function fmt_md(d) return ('%s %d'):format(MONTHS[math.floor(d / 100) % 100] or '?', d % 100) end
+-- 20261109 -> 'Nov 9'
+local function fmt_md(d) return ('%s %d'):format(K.MONTHS[math.floor(d / 100) % 100] or '?', d % 100) end
 
+-- true while today falls inside the saved Hyper Campaign dates
 local function campaign_now()
     local t = jst_today()
     return settings.hyper_start > 0 and t >= settings.hyper_start and t <= settings.hyper_end
@@ -692,12 +641,13 @@ local function parse_campaign(text)
     str = str:gsub('to', '-')
     local a, b = str:match('^([^-]+)%-([^-]+)$')
     if not a then return nil end
+    -- one date: 'oct16', '16oct' or '10/16' -> month * 100 + day
     local function one(x)
         local mon, day = x:match('^(%a+)%.?(%d+)$')
         if not mon then day, mon = x:match('^(%d+)(%a+)$') end
         local m
         if mon then
-            for i, n in ipairs(MONTHS) do if mon:sub(1, 3) == n:lower() then m = i end end
+            for i, n in ipairs(K.MONTHS) do if mon:sub(1, 3) == n:lower() then m = i end end
         else
             local mm, dd = x:match('^(%d+)/(%d+)$')
             m, day = tonumber(mm), dd
@@ -728,17 +678,18 @@ end
 local function zone_wait_left()
     if not zoned_at then return 0 end
     local r = wing_rank(life.wing)
-    local delay = hyper_on() and HYPER_AREA_DELAY or (r and r[3] or 60) -- unknown skill: slowest
+    local delay = hyper_on() and K.HYPER_AREA_DELAY or (r and r[3] or 60) -- unknown skill: slowest
     return math.max(0, zoned_at + delay - os.clock())
 end
 
 -- seconds between digs auto-dig should use right now
 local function dig_delay()
     local wd = wing_delay() or 15 -- unknown Wing Skill: assume the slowest rank to be safe
-    if hyper_on() then wd = math.min(wd, HYPER_DELAY) end
+    if hyper_on() then wd = math.min(wd, K.HYPER_DELAY) end
     return wd
 end
 
+-- store a new Wing Skill level (approx = only the rank was known) and announce it
 local function set_wing(n, approx, quiet)
     n = math.max(0, math.min(100, math.floor(n)))
     local old = life.wing
@@ -750,14 +701,18 @@ local function set_wing(n, approx, quiet)
         approx and '~' or '', n, r[1], r[4], r[3]))
 end
 
-local W_MIN, H = 280, 252
-local W = W_MIN -- panel width; grows/shrinks to fit the longest line
+K.W_MIN = 280
+-- starting panel height (it grows to fit the rows)
+local H = 252
+local W = K.W_MIN -- panel width; grows/shrinks to fit the longest line
+-- text colors for the panel (Windower color codes)
 local C = {
     dim  = '\\cs(140,148,165)', val = '\\cs(235,238,245)',
     good = '\\cs(110,220,150)', warn = '\\cs(255,200,90)',
     bad  = '\\cs(255,110,110)', acc  = '\\cs(120,190,255)', r = '\\cr',
 }
 
+-- a plain colored rectangle (panel backgrounds, bars, buttons)
 local function solid(w, h, a, r, g, b, draggable)
     return images.new({
         pos = {x = settings.pos.x, y = settings.pos.y},
@@ -767,6 +722,7 @@ local function solid(w, h, a, r, g, b, draggable)
     })
 end
 
+-- a transparent Consolas text object for the panel
 local function mk_text(size)
     return texts.new('', {
         pos = {x = settings.pos.x, y = settings.pos.y},
@@ -781,8 +737,10 @@ end
 -- Panel position. The panel is moved by our own mouse handler, which
 -- repositions every piece in the same event, so text never trails the box.
 local px, py = settings.pos.x, settings.pos.y
+-- current panel height, for mouse hit-testing
 local panel_h = H
 
+-- the main panel's pieces: background, header, fatigue bar, buttons, labels
 local hud = {
     bg     = solid(W, H, 215, 18, 20, 28),
     header = solid(W, 26, 255, 38, 52, 84),
@@ -797,34 +755,40 @@ local hud = {
     l_zones = mk_text(9),
 }
 hud.l_zones:text('ZONES')
-local ZBTN_W, ZBTN_H = 56, 18
+K.ZBTN_W, K.ZBTN_H = 56, 18
 
 -- Zone stats window, docked to the right of the main panel
-local ZW_MIN, ZW_GAP = 230, 6
+K.ZW_MIN, K.ZW_GAP = 230, 6
+-- the zone stats window's pieces
 local zwin = {
-    bg     = solid(ZW_MIN, 100, 215, 18, 20, 28),
-    header = solid(ZW_MIN, 26, 255, 38, 52, 84),
+    bg     = solid(K.ZW_MIN, 100, 215, 18, 20, 28),
+    header = solid(K.ZW_MIN, 26, 255, 38, 52, 84),
     title  = mk_text(11),
 }
-local zw_pool, zw_ry, zw_used, zw_w, zw_on = {}, {}, 0, ZW_MIN, false
+-- zone window lines, their offsets, how many are in use, its width, shown?
+local zw_pool, zw_ry, zw_used, zw_w, zw_on = {}, {}, 0, K.ZW_MIN, false
 
 -- Buttons, relative to the panel's top-left corner
-local BTN_Y, BTN_H = 50, 22
+K.BTN_Y, K.BTN_H = 50, 22
+-- width of each START / STOP button (they share the panel width)
 local BTN_W = math.floor((W - 30) / 2)
+-- START and STOP: position inside the panel, image, label
 local buttons = {
     start = {rx = 10,              img = hud.b_start, lbl = hud.l_start, text = 'START'},
     stop  = {rx = 20 + BTN_W,      img = hud.b_stop,  lbl = hud.l_stop,  text = 'STOP'},
 }
 for _, b in pairs(buttons) do
-    b.img:size(BTN_W, BTN_H)
+    b.img:size(BTN_W, K.BTN_H)
     b.lbl:text(b.text)
 end
-local ROWS_Y = BTN_Y + BTN_H + 10 -- first stat row
+K.ROWS_Y = K.BTN_Y + K.BTN_H + 10 -- first stat row
 
 -- One text object per HUD line, so line spacing can be set exactly
 -- (offsets live in their own table: Windower text objects don't keep extra fields)
 local lines_pool, lines_ry, lines_used = {}, {}, 0
+-- is the panel on screen?
 local hud_on = false
+-- when the panel was last redrawn (0 = redraw now)
 local hud_last = 0
 
 -- visible width of a line: Windower's own measurement when it has one,
@@ -839,10 +803,13 @@ end
 
 local layout -- defined below
 local draw_zone_window -- defined below
+-- the header text, kept for measuring the panel width
 local title_str = ''
+-- low greens / low bag space already announced in chat?
 local warned = {greens = false, slots = false}
 local items_hdr_y, items_hdr_h = -100, 0 -- ITEMS FOUND header row, for clicks
 
+-- resize the panel and everything that stretches with it (header, bar, buttons)
 local function set_width(w)
     if w == W then return end
     W = w
@@ -850,7 +817,7 @@ local function set_width(w)
     hud.bar_bg:size(W - 20, 10)
     BTN_W = math.floor((W - 30) / 2)
     buttons.stop.rx = 20 + BTN_W
-    for _, b in pairs(buttons) do b.img:size(BTN_W, BTN_H) end
+    for _, b in pairs(buttons) do b.img:size(BTN_W, K.BTN_H) end
     layout()
 end
 
@@ -862,30 +829,32 @@ layout = function()
     hud.bar_bg:pos(px + 10, py + 34)
     hud.bar:pos(px + 10, py + 34)
     for _, b in pairs(buttons) do
-        b.img:pos(px + b.rx, py + BTN_Y)
+        b.img:pos(px + b.rx, py + K.BTN_Y)
         -- Consolas 10 is about 7.5 px per character
-        b.lbl:pos(px + b.rx + math.floor((BTN_W - #b.text * 7.5) / 2), py + BTN_Y + 3)
+        b.lbl:pos(px + b.rx + math.floor((BTN_W - #b.text * 7.5) / 2), py + K.BTN_Y + 3)
     end
     for i = 1, lines_used do
         local t = lines_pool[i]
         t:pos(px + 10, py + (lines_ry[i] or 0))
     end
-    hud.b_zones:pos(px + W - ZBTN_W - 6, py + 4)
-    hud.l_zones:pos(px + W - ZBTN_W - 6 + 9, py + 5)
+    hud.b_zones:pos(px + W - K.ZBTN_W - 6, py + 4)
+    hud.l_zones:pos(px + W - K.ZBTN_W - 6 + 9, py + 5)
     -- zone window sits just right of the main panel
-    local zx = px + W + ZW_GAP
+    local zx = px + W + K.ZW_GAP
     zwin.bg:pos(zx, py)
     zwin.header:pos(zx, py)
     zwin.title:pos(zx + 10, py + 5)
     for i = 1, zw_used do zw_pool[i]:pos(zx + 10, py + (zw_ry[i] or 0)) end
 end
 
+-- show or hide the zone stats window
 local function zwin_show(on)
     zw_on = on
     for _, e in pairs(zwin) do if on then e:show() else e:hide() end end
     if not on then for _, t in ipairs(zw_pool) do t:hide() end end
 end
 
+-- show or hide the main panel (hiding it hides the zone window too)
 local function hud_show(on)
     for _, e in pairs(hud) do if on then e:show() else e:hide() end end
     if not on then
@@ -894,12 +863,14 @@ local function hud_show(on)
     end
 end
 
+-- should the panel be on screen right now? (setting, auto-hide, mounted, running)
 local function want_hud()
     if not settings.hud_visible then return false end
     if not settings.auto_hide then return true end
     return S.running or is_mounted()
 end
 
+-- show/hide the panel when want_hud() changes (force = re-apply anyway)
 local function refresh_visibility(force)
     local w = want_hud() and true or false
     if w ~= hud_on or force then
@@ -930,18 +901,19 @@ draw_zone_window = function(sp)
         return
     end
     if not zw_on then zwin_show(true) end
-    local zid = current_zone()
+    local zid = Z.current_zone()
     local wr = wing_rank(life.wing)
     local rank = wr and wr[1] or 'Unknown'
-    local e = zid and zstats[zid] and zstats[zid][rank]
+    local e = zid and Z.stats()[zid] and Z.stats()[zid][rank]
     local title = C.acc .. 'ZONE STATS' .. C.r
     zwin.title:text(title)
 
     local out, y = {}, 34
+    -- add one line to the window at the next row
     local function add(text) out[#out + 1] = {text, y}; y = y + sp end
-    add(C.val .. zone_name(zid) .. C.r)
+    add(C.val .. Z.zone_name(zid) .. C.r)
     add(C.dim .. 'Wing rank  ' .. C.r .. rank)
-    local all = zid and combined_entry(zid, rank)
+    local all = zid and Z.combined(zid, rank)
     if all and all.digs > 0 then
         add(C.dim .. 'All players' .. C.r .. (' %s digs  %s(%d%% hit)%s'):format(commas(all.digs), C.dim,
             math.floor(all.finds / all.digs * 100 + 0.5), C.r))
@@ -991,12 +963,13 @@ draw_zone_window = function(sp)
 
     local widest = text_width(zwin.title, title, 8.3)
     for i, l in ipairs(out) do widest = math.max(widest, text_width(zw_pool[i], l[1], 7.5)) end
-    zw_w = math.max(ZW_MIN, math.ceil(widest) + 22)
+    zw_w = math.max(K.ZW_MIN, math.ceil(widest) + 22)
     zwin.header:size(zw_w, 26)
     zwin.bg:size(zw_w, y + 6)
     layout()
 end
 
+-- the State row: IDLE / DIGGING / MOVING / PAUSED, colored
 local function state_text()
     if not S.running then return C.dim .. 'IDLE' .. C.r end
     if S.paused then return C.warn .. 'PAUSED' .. C.r end
@@ -1004,11 +977,14 @@ local function state_text()
     return C.good .. 'DIGGING' .. C.r
 end
 
+-- one panel row: dim label padded to 12 characters, then the value
 local function row(label, value)
     -- labels padded to 12 so the values sit a few spaces clear of them
     return C.dim .. ('%-12s'):format(label) .. C.r .. C.val .. value .. C.r
 end
 
+-- redraw the whole panel (called 5 times a second while it's showing):
+-- warnings, the stat rows, the item list, then size the box to fit
 local function update_hud(now)
     if not hud_on then return end
 
@@ -1092,7 +1068,7 @@ local function update_hud(now)
 
     local rows = {
         row('State', state_text() .. ((S.running and anchor and settings.roam_radius > 0 and pos)
-            and (C.dim .. ('  %d/%dy from centre'):format(math.floor(dist2d(pos, anchor)), math.floor(settings.roam_radius)) .. C.r) or '')),
+            and (C.dim .. ('  %d/%dy from center'):format(math.floor(dist2d(pos, anchor)), math.floor(settings.roam_radius)) .. C.r) or '')),
         row('Fatigue', f_col .. life.fatigue .. C.r .. C.dim .. (cap > 0 and (' / ' .. cap .. '  (' .. math.max(0, cap - life.fatigue) .. ' left' .. eta .. ')') or '') .. C.r),
         row('Free digs', C.good .. life.free .. C.r .. C.dim .. (' (' .. ((life.fatigue + life.free) > 0 and math.floor(life.free / (life.fatigue + life.free) * 100) or 0) .. '% today)') .. C.r),
         row('Attempts', ('%d  %s(%d hit / %d miss)%s'):format(S.attempts, C.dim, S.successes, S.fails, C.r)),
@@ -1123,7 +1099,7 @@ local function update_hud(now)
 
     -- Hyper Chocobo Digging Campaign status (only shown when it matters)
     if hyper_on() then
-        table.insert(rows, 3, row('Hyper', C.good .. 'ACTIVE' .. C.r .. C.dim .. (' (%ds cooldown%s)'):format(HYPER_DELAY,
+        table.insert(rows, 3, row('Hyper', C.good .. 'ACTIVE' .. C.r .. C.dim .. (' (%ds cooldown%s)'):format(K.HYPER_DELAY,
             (hyper_mode == 'auto' and campaign_now()) and (', until ' .. fmt_md(settings.hyper_end)) or '') .. C.r))
     elseif hyper_test and S.running then
         table.insert(rows, 3, row('Hyper', C.warn .. 'testing...' .. C.r))
@@ -1133,10 +1109,15 @@ local function update_hud(now)
     local td = today()
     table.insert(rows, #rows, row('Today', ('%d finds  %s(%d digs, %d session%s)%s'):format(
         td.finds, C.dim, td.attempts, td.sessions, td.sessions == 1 and '' or 's', C.r)))
+    local roe_main, roe_extra = ROE.row_text()
+    if roe_main then
+        table.insert(rows, #rows, row('RoE', roe_main .. C.dim .. roe_extra .. C.r))
+    end
 
     rows[#rows + 1] = row('Sold', C.good .. commas(life.gil) .. C.r .. C.dim .. ' gil (+' .. commas(td.gil) .. ' today)' .. C.r)
     rows[#rows + 1] = row('Est. val', commas(value_of(life.drops)) .. C.dim .. ' gil (+' .. commas(value_of(td.drops)) .. ' today)' .. C.r)
 
+    -- a currency row: lifetime total plus today's gain
     local function cur_row(label, key)
         return row(label, C.good .. commas(life.cur[key] or 0) .. C.r ..
             C.dim .. ' (+' .. commas(td.cur[key] or 0) .. ' today)' .. C.r)
@@ -1148,7 +1129,7 @@ local function update_hud(now)
     -- compact mode: only the rows you need while digging
     if settings.compact then
         local keep = {Warning = 1, State = 1, Wing = 1, Hyper = 1, Fatigue = 1, Greens = 1,
-                      Inventory = 1, ['Next dig'] = 1, Today = 1}
+                      Inventory = 1, ['Next dig'] = 1, Today = 1, RoE = 1}
         local kept = {}
         for _, r in ipairs(rows) do
             local label = r:gsub('\\cs%(%d+,%d+,%d+%)', ''):gsub('\\cr', ''):sub(1, 12):gsub('%s+$', '')
@@ -1159,8 +1140,8 @@ local function update_hud(now)
 
     local sp = math.max(10, settings.line_spacing)
     local out = {}
-    for i, r in ipairs(rows) do out[#out + 1] = {r, ROWS_Y + (i - 1) * sp} end
-    local fy = ROWS_Y + #rows * sp + 8 -- items list starts below however many rows there are
+    for i, r in ipairs(rows) do out[#out + 1] = {r, K.ROWS_Y + (i - 1) * sp} end
+    local fy = K.ROWS_Y + #rows * sp + 8 -- items list starts below however many rows there are
 
     -- every item found (session or lifetime), most common first
     -- "today" comes from the saved daily history, so it survives reloads and
@@ -1192,11 +1173,11 @@ local function update_hud(now)
     draw_lines(out)
 
     -- size the box to the longest line (Consolas 10 is ~7.5 px a character, 11 is ~8.3)
-    local widest = text_width(hud.title, title_str, 8.3) + ZBTN_W + 12 -- room for the ZONES button
+    local widest = text_width(hud.title, title_str, 8.3) + K.ZBTN_W + 12 -- room for the ZONES button
     for i, l in ipairs(out) do
         widest = math.max(widest, text_width(lines_pool[i], l[1], 7.5))
     end
-    set_width(math.max(W_MIN, math.ceil(widest) + 22))
+    set_width(math.max(K.W_MIN, math.ceil(widest) + 22))
 
     panel_h = fy + #lines * sp + 8
     hud.bg:size(W, panel_h) -- panel grows with the list
@@ -1216,6 +1197,7 @@ local function stop_moving()
     turn_until = 0
 end
 
+-- turn the character by an angle (radians), relative to where it faces now
 local function turn_by(rad)
     local me = get_me()
     if me and me.facing then
@@ -1232,13 +1214,25 @@ local function heading_to(from, to)
 end
 
 -- New heading after a dig: random, unless the next spot would leave the area,
--- in which case head back toward the centre (give or take 45 degrees).
+-- in which case head back toward the center (give or take 45 degrees).
 -- returns a heading, or nil to keep going the way you're facing
 local function roam_heading(pos)
     local r = settings.roam_radius
+    -- any direction
     local function rnd() return math.random() * 2 * math.pi end
     local step = settings.required_distance + 1
+    -- near a wall we hit, don't head back toward it (within 70 degrees)
+    local wall = S.wall
+    if wall and dist2d(pos, wall.pos) > 10 then S.wall, wall = nil, nil end -- left it behind
+    -- would heading f point back at the wall we just hit? (within 70 degrees)
+    local function into_wall(f)
+        if not wall then return false end
+        local d = math.abs((f - wall.facing + math.pi) % (2 * math.pi) - math.pi)
+        return d < math.rad(70)
+    end
+    -- is heading f allowed: not into the wall, and the next spot stays in the area?
     local function fits(f)
+        if into_wall(f) then return false end
         if not anchor or r <= 0 then return true end
         local nx, ny = pos.x + math.cos(f) * step, pos.y - math.sin(f) * step
         return dist2d({x = nx, y = ny}, anchor) <= r
@@ -1249,12 +1243,12 @@ local function roam_heading(pos)
     if me and me.facing and math.random() * 100 >= settings.turn_chance and fits(me.facing) then
         return nil
     end
-    if not anchor or r <= 0 then return rnd() end
-    for _ = 1, 8 do -- try a few random headings that keep the next spot inside
+    for _ = 1, 12 do -- try random headings that stay inside and off the wall
         local f = rnd()
-        local nx, ny = pos.x + math.cos(f) * step, pos.y - math.sin(f) * step
-        if dist2d({x = nx, y = ny}, anchor) <= r then return f end
+        if fits(f) then return f end
     end
+    if wall then return wall.facing + math.pi + (math.random() * 2 - 1) * math.pi / 4 end
+    if not anchor or r <= 0 then return rnd() end
     return heading_to(pos, anchor) + (math.random() * 2 - 1) * math.pi / 4
 end
 
@@ -1263,14 +1257,19 @@ end
 local function start_moving(mode, dist)
     local pos = get_pos()
     if not pos then return end
-    if mode == 'away' then -- turn away from a wall: 120-240 degrees
-        turn_by(math.pi + (math.random() * 2 - 1) * math.pi / 3)
-        turn_until = os.clock() + 0.4
+    if mode == 'side' then -- turn left or right (90-120 degrees)
+        local sign = math.random() < 0.5 and -1 or 1
+        turn_by(sign * (math.pi / 2 + math.random() * math.pi / 6))
+        turn_until = os.clock() + 0.25
+    elseif mode == 'away' then -- face away from the last wall (120-240 degrees from it)
+        local base = S.wall and S.wall.facing or ((get_me() or {}).facing or 0)
+        windower.ffxi.turn((base + math.pi + (math.random() * 2 - 1) * math.pi / 3) % (2 * math.pi))
+        turn_until = os.clock() + 0.25
     elseif mode == 'roam' then
         local f = roam_heading(pos)
         if f then
             windower.ffxi.turn(f % (2 * math.pi))
-            turn_until = os.clock() + 0.4 -- finish turning before running
+            turn_until = os.clock() + 0.25 -- finish turning before running
         end
     elseif mode == 'reverse' then
         turn_by(math.pi + (math.random() * 2 - 1) * math.pi / 6)
@@ -1279,6 +1278,8 @@ local function start_moving(mode, dist)
         turn_by(sign * (math.pi / 2 + math.random() * math.pi / 2))
     end
     move_target = dist or settings.required_distance
+    S.move_mode = tostring(mode)
+    dbg('MOVE', ('start %s, %.0f yalms'):format(S.move_mode, move_target))
     move_start_pos, move_start_time = pos, os.clock()
     prog_pos, prog_time = pos, os.clock()
     moving = true
@@ -1290,14 +1291,17 @@ local blocked_count = 0    -- wall hits since the last good move
 local wall_hit = false     -- last stop was a wall: turn away after the next dig
 local prev_dig_pos = nil   -- where the last real dig happened (restored after bad ground)
 local auto_wait = nil      -- os.clock() of our own /dig, until the game answers
+-- leftover from an older 15-second limit on the can't-dig-here message; no longer used
 local bad_ground_log = 0
 
+-- far enough from the last dig (or allowed to dig here after bad ground / a wall)?
 local function can_dig_here()
     if retry_here or not last_dig_pos then return true end
     local pos = get_pos()
     return pos and dist2d(pos, last_dig_pos) >= settings.required_distance
 end
 
+-- stop auto-digging and say why
 local function stop_addon(reason)
     S.running, S.paused = false, false
     auto_wait, retry_here = nil, false
@@ -1306,6 +1310,8 @@ local function stop_addon(reason)
     log(('Stopped%s Finds this session: %d'):format(reason and (': ' .. reason) or '.', S.successes))
 end
 
+-- start auto-digging (or resume if paused): set up the area, campaign test
+-- and zone wait, and say what timing will be used
 local function start_addon()
     if S.running and S.paused then
         S.paused = false
@@ -1314,9 +1320,16 @@ local function start_addon()
     end
     if S.running then return end
     roll_day()
+    -- already at today's find limit: don't start (and waste a dig) just to stop
+    if settings.max_success > 0 and today().finds >= settings.max_success then
+        log(('Already at %d finds today (limit %d). It resets at midnight in Japan; //bup set max to change it.'):format(
+            today().finds, settings.max_success))
+        return
+    end
     S.running, S.paused, next_dig = true, false, 0
     anchor, need_spin = get_pos(), false -- stay around where you started
     bad_streak, blocked_count, wall_hit = 0, 0, false
+    S.wall = nil
     local wd = wing_delay()
     hyper_test = nil
     if hyper_mode == 'on' then S.hyper = true
@@ -1325,7 +1338,7 @@ local function start_addon()
         S.hyper = nil -- your campaign dates cover today: no need to test
     else
         S.hyper = nil
-        if (wd or 15) > HYPER_DELAY then hyper_test = 'need_base' end -- campaign would speed us up: test it
+        if (wd or 15) > K.HYPER_DELAY then hyper_test = 'need_base' end -- campaign would speed us up: test it
     end
     log('Started. Be mounted on your chocobo.' ..
         (wd and (' Wing Skill cooldown %ds.'):format(wd)
@@ -1345,6 +1358,7 @@ local last_ok_t = 0 -- os.clock() when the last dig that got a result was sent
 
 -- how long results take to arrive (seconds), last 30 digs
 local latency = {}
+-- record how long one dig result took (keeps the last 30)
 local function add_latency(v)
     if v <= 0 or v > 30 then return end
     latency[#latency + 1] = v
@@ -1354,6 +1368,7 @@ end
 -- the no-result wait: 90th-percentile result time + 1.5s, kept between 3 and 12s
 local wait_bump = 0 -- raised after each no-result, eased off as results arrive
 
+-- how long to wait for a dig result before deciding none is coming
 local function result_wait()
     if not settings.auto_tune then return settings.result_timeout end
     if #latency < 5 then return math.max(settings.result_timeout, wait_bump) end
@@ -1372,15 +1387,24 @@ local function hyper_failed()
     auto_wait = nil
     last_dig_pos = prev_dig_pos
     retry_here = true
-    next_dig = last_ok_t + math.max(settings.dig_interval, dig_delay() + 0.5)
+    next_dig = last_ok_t + dig_delay() + 0.3 + settings.extra_wait
     log(('No Hyper Chocobo Digging Campaign detected. Digging every %ds.'):format(dig_delay()))
 end
 
 local gave_up_spot = nil -- where we gave up waiting; used if the result turns up late
 local gave_up_t = nil    -- when that given-up dig was sent
 
+-- a dig failed: 'game said no' (You cannot dig here.) or 'no result'.
+-- Counts toward the 7-in-a-row stop, then moves away to try somewhere else.
 local function bad_ground(why)
-    if hyper_test == 'probing' then hyper_failed() return end
+    if hyper_test == 'probing' then
+        -- no answer at all to the campaign test dig = the game wouldn't dig that
+        -- soon: no campaign. But "You cannot dig here." only means bad ground,
+        -- so treat it that way and run the test again on the next spot.
+        if why == 'no result' then hyper_failed() return end
+        hyper_test = 'probe_next'
+        dbg('HYPER', 'test dig landed on bad ground; testing again on the next spot')
+    end
     -- stop waiting, but keep S.pending: a result that turns up late
     -- (within 12s of the dig) is still recorded
     -- no answer in time: maybe the connection is slow. Wait 50% longer next
@@ -1388,9 +1412,14 @@ local function bad_ground(why)
     if settings.auto_tune and why == 'no result' then
         wait_bump = math.min(12, result_wait() * 1.5)
     end
-    gave_up_t = auto_wait
+    -- only a dig that got no answer at all can still have a result coming.
+    -- A refusal ("You cannot dig here.") IS that dig's answer, so it must not
+    -- be remembered as waiting, or the next real result gets pinned on it.
+    if why == 'no result' then
+        gave_up_t = auto_wait
+        gave_up_spot = last_dig_pos
+    end
     auto_wait = nil
-    gave_up_spot = last_dig_pos
     bad_streak = bad_streak + 1
     if settings.bad_ground_limit > 0 and bad_streak >= settings.bad_ground_limit then
         local n = bad_streak
@@ -1409,9 +1438,21 @@ local function bad_ground(why)
         log(('Can\'t dig here (%s). Turning around and trying a few yalms away. (%d/%d)'):format(
             why, bad_streak, settings.bad_ground_limit))
     end
-    start_moving('reverse', settings.turn_distance)
+    -- several refusals in a row = a patch of bad ground: don't just bounce
+    -- back and forth. 1st: turn around; after that: turn left or right and go
+    -- 2 yalms further each time.
+    local pos = get_pos()
+    local dist = settings.turn_distance + (bad_streak - 1) * 2
+    if S.wall and pos and dist2d(pos, S.wall.pos) < 6 then
+        start_moving('away', dist) -- near a wall: away from it, not just about-face
+    elseif bad_streak <= 1 then
+        start_moving('reverse', dist)
+    else
+        start_moving('side', dist)
+    end
 end
 
+-- send /dig and schedule the earliest next dig from the cooldown
 local function attempt_dig()
     stop_moving()
     prev_dig_pos, last_dig_pos = last_dig_pos, get_pos()
@@ -1421,7 +1462,8 @@ local function attempt_dig()
     if hyper_test == 'probe_next' then hyper_test = 'probing' end
     -- never faster than the cooldown (Wing Skill, or the campaign's), plus a little slack
     local wd = dig_delay()
-    local wait = math.max(settings.dig_interval, wd + 0.5) + (math.random() * 2 - 1) * settings.jitter
+    -- the cooldown sets the pace; the move to the next spot happens inside it
+    local wait = wd + 0.3 + settings.extra_wait + math.random() * settings.jitter
     next_dig = os.clock() + math.max(wd + 0.3, wait)
     windower.send_command('input /dig')
 end
@@ -1431,6 +1473,7 @@ end
 ---------------------------------------------------------------------------
 local last_find = nil -- {t = os.clock(), free = bool}: the most recent successful dig
 
+-- add a currency reward (conquest points, bayld...) to session, lifetime and today
 local function add_currency(cur)
     if not cur then return end
     life.cur[cur[1]] = (life.cur[cur[1]] or 0) + cur[2]
@@ -1440,6 +1483,7 @@ local function add_currency(cur)
     life_dirty = true
 end
 
+-- add a found item to session, lifetime and today's lists
 local function add_item(item, cur)
     register_dug(item)
     S.drops[item] = (S.drops[item] or 0) + 1
@@ -1468,6 +1512,14 @@ local function dig_answered()
     local now = os.clock()
     -- Results arrive in the order digs were sent, so if we gave up on a dig
     -- less than 12s ago, this result is that dig's: it was just slow.
+    -- ...unless the newer dig has been out long enough to have answered itself
+    -- (results take at least ~80% of the quickest one seen): then it's the
+    -- newer dig's result, and the old one really never answered.
+    if gave_up_t and auto_wait then
+        local quickest = 2.5
+        for _, v in ipairs(latency) do if v < quickest / 0.8 then quickest = v * 0.8 end end
+        if now - auto_wait >= quickest then gave_up_t, gave_up_spot = nil, nil end
+    end
     if gave_up_t and now - gave_up_t <= 12 then
         local took = now - gave_up_t
         add_latency(took)
@@ -1479,7 +1531,7 @@ local function dig_answered()
         gave_up_t, gave_up_spot = nil, nil
         if auto_wait then return end -- a newer dig is still waiting for its own result
         last_dig_pos, retry_here = spot, false
-        settle_until = now + settings.dig_settle
+        settle_until = now + settings.result_buffer
         S.pending = nil
         return
     end
@@ -1492,14 +1544,17 @@ local function dig_answered()
     gave_up_spot = nil
     bad_streak = 0
     blocked_count = 0
-    settle_until = os.clock() + settings.dig_settle -- let the dig finish
+    -- the dig animation starts when /dig is sent, so count the settle from then:
+    -- the move to the next spot then happens inside the dig cooldown
+    -- (dig > move > dig) instead of after it
+    settle_until = os.clock() + settings.result_buffer
     S.pending, auto_wait = nil, nil
     if hyper_test == 'need_base' then
         hyper_test = 'probe_next' -- try the next dig at campaign speed
-        next_dig = last_ok_t + math.max(settings.dig_interval, HYPER_DELAY + 0.5)
+        next_dig = last_ok_t + K.HYPER_DELAY + 0.3 + settings.extra_wait
     elseif hyper_test == 'probing' then
         S.hyper, hyper_test = true, nil
-        next_dig = last_ok_t + math.max(settings.dig_interval, HYPER_DELAY + 0.5)
+        next_dig = last_ok_t + K.HYPER_DELAY + 0.3 + settings.extra_wait
         log(('Hyper Chocobo Digging Campaign detected! Digging every %ds instead of %ds.'):format(
             dig_delay(), wing_delay() or 15))
     end
@@ -1512,7 +1567,7 @@ end
 -- so this only counts the proc; the Obtained line that follows is the dig's result.
 local function record_discern()
     roll_day()
-    local z = zone_entry()
+    local z = Z.entry()
     if z then z.discern = z.discern + 1 end
     dbg('RESULT', 'discernment proc')
     S.discern = S.discern + 1
@@ -1523,11 +1578,13 @@ local function record_discern()
     save_life(false)
 end
 
+-- a dig's result arrived: item = what was found, nil = a miss. Updates every
+-- counter, zone stats, fatigue and the stop checks.
 local function record(item, cur)
     roll_day()
     dig_answered()
     count_dig()
-    local z = zone_entry()
+    local z = Z.entry()
     if z then
         z.digs = z.digs + 1
         if item then
@@ -1553,8 +1610,9 @@ local function record(item, cur)
     end
     life_dirty = true
     save_life(false)
-    if S.running and settings.max_success > 0 and S.successes >= settings.max_success then
-        stop_addon(('reached %d finds.'):format(settings.max_success))
+    -- the find limit counts today's finds (resets at midnight in Japan, survives reloads)
+    if S.running and settings.max_success > 0 and today().finds >= settings.max_success then
+        stop_addon(('reached %d finds today.'):format(settings.max_success))
     end
 end
 
@@ -1572,6 +1630,7 @@ local function mark_free()
     life_dirty = true
 end
 
+-- Typed commands: a /dig marks a dig as waiting for its result.
 windower.register_event('outgoing text', function(original)
     if original and original:lower():match('^/dig') then
         dbg('OUT', original)
@@ -1581,18 +1640,20 @@ windower.register_event('outgoing text', function(original)
     end
 end)
 
-local STOP_PATTERNS = { -- best-effort; verify wording on your server and extend as needed
+K.STOP_PATTERNS = { -- best-effort; verify wording on your server and extend as needed
     'you do not have any gysahl', "you don't have any gysahl",
     'cannot carry any more', 'inventory is full',
 }
 
 -- ground that can't be dug: turn around instead of stopping
 -- (best guesses at the wording; if no result arrives at all, that counts too)
-local BAD_GROUND_PATTERNS = {
+K.BAD_GROUND_PATTERNS = {
     'unable to dig', 'cannot dig here', "can't dig here", 'you cannot dig',
     'cannot use that command', "can't use that command", 'cannot use the command',
 }
 
+-- Every chat line: dig results, Wing Skill, Discernment, free digs, currency,
+-- Records of Eminence, refusals and stop messages are all read here.
 windower.register_event('incoming text', function(original, modified, mode)
     if not original then return end
     -- debug: every line while auto-digging, or within 20s of a dig
@@ -1603,6 +1664,12 @@ windower.register_event('incoming text', function(original, modified, mode)
                           :gsub(string.char(0x7F) .. '.', '')
     local lower = clean:lower()
     if clean:find('[BirdUp]', 1, true) then return end -- our own chat lines
+    if debug_f and (S.running or (S.pending and os.clock() - S.pending < 20)) then
+        debug_unknown.note(clean, mode)
+    end
+
+    -- Records of Eminence progress (birdup_roe.lua)
+    if ROE.handle(clean) then return end
 
     -- Wing Skill. Confirmed in game: "Your wing skill improved to 15!"
     -- Other wordings are matched loosely in case NPCs phrase it differently:
@@ -1620,8 +1687,8 @@ windower.register_event('incoming text', function(original, modified, mode)
         elseif gain then
             log('Wing Skill went up, but the current level is unknown. Set it with //bup wing <level>.')
         else
-            for i = #WING_RANKS, 1, -1 do -- a rank name with no number: use the rank's lowest level
-                local w = WING_RANKS[i]
+            for i = #K.WING_RANKS, 1, -1 do -- a rank name with no number: use the rank's lowest level
+                local w = K.WING_RANKS[i]
                 if lower:find(w[1]:lower(), 1, true) then
                     if not life.wing or wing_rank(life.wing)[1] ~= w[1] then set_wing(w[2], true) end
                     break
@@ -1630,14 +1697,24 @@ windower.register_event('incoming text', function(original, modified, mode)
         end
     end
 
+    -- "You must wait longer to perform that action." = dug too soon (cooldown or
+    -- the last dig still playing). Not bad ground: wait a moment, dig here again.
+    if S.running and auto_wait and lower:find('wait longer to perform', 1, true) then
+        if hyper_test == 'probing' then hyper_failed() return end
+        dbg('MOVE', 'too soon: retrying this spot in 1s')
+        auto_wait = nil
+        last_dig_pos, retry_here = prev_dig_pos, true
+        next_dig = math.max(next_dig, os.clock() + 1)
+        return
+    end
     if S.running and auto_wait then
-        for _, p in ipairs(BAD_GROUND_PATTERNS) do
+        for _, p in ipairs(K.BAD_GROUND_PATTERNS) do
             if lower:find(p, 1, true) then bad_ground('game said no') return end -- (a refused test dig = no campaign)
         end
     end
 
     if S.running then
-        for _, p in ipairs(STOP_PATTERNS) do
+        for _, p in ipairs(K.STOP_PATTERNS) do
             if lower:find(p, 1, true) then stop_addon(clean) return end
         end
     end
@@ -1666,6 +1743,7 @@ windower.register_event('incoming text', function(original, modified, mode)
     --   "...cache of beastman confederate resources and receive N allied notes!"
     --   "You receive N bayld!"
     local found, cur
+    -- the number in a currency line, e.g. 'You receive 50 bayld' -> 50
     local function amt(pat)
         local n = lower:match(pat)
         return n and tonumber((n:gsub(',', ''))) or nil
@@ -1704,19 +1782,53 @@ end)
 ---------------------------------------------------------------------------
 local sell_req = nil     -- {id, count, t}: item picked at the vendor
 local sale_pending = nil -- {name, count, gil0, t}: confirmed, waiting for gil
+-- when the gil was last checked for a pending sale
 local sale_check_t = 0
 
+-- read 2- and 4-byte little-endian numbers from a game packet
 local function u16(data, i) return data:byte(i) + data:byte(i + 1) * 256 end
 local function u32(data, i) return u16(data, i) + u16(data, i + 2) * 65536 end
 
-local function record_sale(name, qty, gil)
+local record_sale -- defined in the block below (keeps its helpers out of the top level)
+do
+-- Which city's fame applies where you're standing. Each nation's zones are
+-- grouped; anywhere else (Norg, Selbina, Rabao...) uses the zone's own name.
+local CITY_PARTS = {
+    {"d'Oraguille", "San d'Oria"}, {"San d'Oria", "San d'Oria"},
+    {'Metalworks', 'Bastok'}, {'Bastok', 'Bastok'},
+    {'Heavens Tower', 'Windurst'}, {'Windurst', 'Windurst'},
+    {"Ru'Lude", 'Jeuno'}, {'Jeuno', 'Jeuno'},
+    {'Aht Urhgan', 'Aht Urhgan'}, {'Al Zahbi', 'Aht Urhgan'},
+    {'Adoulin', 'Adoulin'},
+}
+-- which city's fame applies where you're standing (each nation's zones count as one)
+local function current_city()
+    local zid = Z.current_zone()
+    if not zid then return 'Unknown' end
+    local zn = Z.zone_name(zid)
+    for _, c in ipairs(CITY_PARTS) do
+        if zn:find(c[1], 1, true) then return c[2] end
+    end
+    return zn
+end
+
+local cheaper_told = {} -- "item|city" already warned this session
+
+-- a vendor sale of a dug item went through: save the city price, update the
+-- best price, and mention it if another city pays more
+record_sale = function(name, qty, gil)
     if qty <= 0 or gil <= 0 then return end
     local unit = math.floor(gil / qty + 0.5)
+    local city = current_city()
+    cprices[name] = cprices[name] or {}
+    local old_here = cprices[name][city]
+    cprices[name][city] = unit
+    -- the item's main price is the best city price you know
+    local best, best_city = 0, nil
+    for c, n in pairs(cprices[name]) do if n > best then best, best_city = n, c end end
     local old = prices[name]
-    if old ~= unit then -- same price as before: nothing to update
-        prices[name] = unit
-        save_prices()
-    end
+    if old ~= best then prices[name] = best end
+    if old_here ~= unit or old ~= best then save_prices() end
     life.gil = life.gil + gil
     S.gil = S.gil + gil
     local td = today()
@@ -1724,15 +1836,26 @@ local function record_sale(name, qty, gil)
     life_dirty = true
     save_life(true)
     -- echo only when the price list changes; a sale at the known price is silent
-    if not old then
-        log(('Price history: %s added at %s gil each (sold %d for %s gil).'):format(
-            name, commas(unit), qty, commas(gil)))
-    elseif old ~= unit then
-        log(('Price history: %s updated %s -> %s gil each (sold %d for %s gil).'):format(
-            name, commas(old), commas(unit), qty, commas(gil)))
+    if not old_here then
+        log(('Price history: %s added at %s gil each in %s (sold %d for %s gil).'):format(
+            name, commas(unit), city, qty, commas(gil)))
+    elseif old_here ~= unit then
+        log(('Price history: %s in %s updated %s -> %s gil each (sold %d for %s gil).'):format(
+            name, city, commas(old_here), commas(unit), qty, commas(gil)))
+    end
+    -- another city pays more (fame differs by city): say so once per item and city
+    local other, other_city = 0, nil
+    for c, n in pairs(cprices[name]) do if c ~= city and n > other then other, other_city = n, c end end
+    if other > unit and not cheaper_told[name .. '|' .. city] then
+        cheaper_told[name .. '|' .. city] = true
+        log(('Heads up: %s sells for %s gil each in %s, but %s here in %s (%s less each).'):format(
+            name, commas(other), other_city, commas(unit), city, commas(other - unit)))
     end
 end
+end -- record_sale block
 
+-- Packets you send: the dig action (0x01A, also for Dig from the menu) and the
+-- vendor sell packets (0x084 pick, 0x085 confirm).
 windower.register_event('outgoing chunk', function(id, data)
     -- 0x01A action packet, category 0x11 = chocobo dig. Sent for typed /dig
     -- AND for Dig picked from the menu, so menu digs are tracked too.
@@ -1755,6 +1878,7 @@ windower.register_event('outgoing chunk', function(id, data)
     end
 end)
 
+-- after a confirmed sale, wait (up to 5s) for the gil to arrive and record it
 local function check_sales(now)
     if not sale_pending or now - sale_check_t < 0.2 then return end
     sale_check_t = now
@@ -1763,7 +1887,7 @@ local function check_sales(now)
         record_sale(sale_pending.name, sale_pending.count, gil - sale_pending.gil0)
         sale_pending = nil
     elseif now - sale_pending.t > 5 then
-        sale_pending = nil -- gil never arrived (sale cancelled or refused)
+        sale_pending = nil -- gil never arrived (sale canceled or refused)
     end
 end
 
@@ -1771,6 +1895,13 @@ end
 -- Main loop
 ---------------------------------------------------------------------------
 local function tick(now)
+    -- has the chocobo actually stopped? (it slides a little after running stops)
+    do
+        local pos = get_pos()
+        if pos and not (S.still_pos and dist2d(pos, S.still_pos) < 0.05) then
+            S.still_pos, S.still_since = pos, now -- moved: restart the clock
+        end
+    end
     roll_day() -- the fatigue check below must see today's count, not yesterday's
     if greens and greens <= 0 then stop_addon('out of Gysahl Greens.') return end
 
@@ -1805,6 +1936,9 @@ local function tick(now)
         local function blocked(why)
             stop_moving()
             blocked_count = blocked_count + 1
+            -- remember the wall: where it is and which way it faces us
+            local me = get_me()
+            if pos and me and me.facing then S.wall = {pos = pos, facing = me.facing} end
             dbg('MOVE', ('blocked (%s), count %d'):format(why, blocked_count))
             if blocked_count == 1 then
                 retry_here, wall_hit = true, true -- dig where it stopped
@@ -1813,14 +1947,21 @@ local function tick(now)
                 start_moving('away', settings.required_distance)
             end
         end
-        local min_prog = math.max(settings.stuck_epsilon, settings.blocked_progress * settings.stuck_check_time)
+        -- blocked = less than 40% of your normal running speed (measured as you
+        -- go), so grinding along a wall at a shallow angle counts too
+        local min_prog = math.max(settings.stuck_epsilon, settings.blocked_progress * settings.stuck_check_time,
+            0.4 * (S.run_speed or 0) * settings.stuck_check_time)
         if pos and move_start_pos and dist2d(pos, move_start_pos) >= move_target then
             stop_moving()
             blocked_count = 0
         elseif pos and prog_pos and now - prog_time >= settings.stuck_check_time then
-            if dist2d(pos, prog_pos) < min_prog then
+            local moved = dist2d(pos, prog_pos)
+            if moved < min_prog then
                 blocked('no progress')
             else
+                -- learn normal running speed (top speed seen, slowly forgotten)
+                local spd = moved / (now - prog_time)
+                S.run_speed = math.max(spd, (S.run_speed or 0) * 0.98)
                 prog_time, prog_pos = now, pos
             end
         elseif now - move_start_time >= settings.move_timeout then
@@ -1856,14 +1997,21 @@ local function tick(now)
 
     if can_dig_here() then
         if zone_wait_left() > 0 then return end -- area delay after zoning
+        -- only dig once the chocobo has really stopped: the game won't dig
+        -- while it's still sliding, and that would look like bad ground
+        if moving then stop_moving() end
+        if now - (S.still_since or 0) < settings.stop_settle then return end
         attempt_dig()
     else
         go()
     end
 end
 
+-- when the Japan date was last checked
 local day_check = 0
 
+-- Every frame: day change, greens/inventory, the panel (5x a second), sale
+-- checks, auto-dig, and saving.
 windower.register_event('prerender', function()
     local now = os.clock()
     -- check for the JST day change on its own, even while the panel is hidden
@@ -1878,18 +2026,21 @@ windower.register_event('prerender', function()
     end
 end)
 
+-- Zoning stops auto-dig and starts the area-delay timer.
 windower.register_event('zone change', function()
     zoned_at = os.clock()
-    dbg('ZONE', zone_name(current_zone()))
+    dbg('ZONE', Z.zone_name(Z.current_zone()))
     if S.running then stop_addon('zone change.') end
 end)
+-- Logging out: save and stop.
 windower.register_event('logout', function()
     if S.running then stop_addon('logout.') end
     save_life(true)
 end)
+-- Unloading/reloading the addon: save, stop moving, close the debug log.
 windower.register_event('unload', function()
     stop_moving(); save_life(true); hud_show(false)
-    if debug_f then dbg('END', 'addon unloaded'); debug_f:close(); debug_f = nil end
+    if debug_f then debug_unknown.close('addon unloaded') end
 end)
 ---------------------------------------------------------------------------
 -- Per-character support
@@ -1909,14 +2060,16 @@ end
 ---------------------------------------------------------------------------
 local drag, pressed = nil, nil -- drag = {dx, dy}
 
+-- is the mouse inside this rectangle?
 local function inside(mx, my, x, y, w, h)
     return mx >= x and mx <= x + w and my >= y and my <= y + h
 end
 
+-- which panel button is under the mouse ('start', 'stop', 'zones'), if any
 local function button_at(mx, my)
-    if inside(mx, my, px + W - ZBTN_W - 6, py + 4, ZBTN_W, ZBTN_H) then return 'zones' end
+    if inside(mx, my, px + W - K.ZBTN_W - 6, py + 4, K.ZBTN_W, K.ZBTN_H) then return 'zones' end
     for key, b in pairs(buttons) do
-        if inside(mx, my, px + b.rx, py + BTN_Y, BTN_W, BTN_H) then return key end
+        if inside(mx, my, px + b.rx, py + K.BTN_Y, BTN_W, K.BTN_H) then return key end
     end
 end
 
@@ -1966,6 +2119,8 @@ windower.register_event('mouse', function(type, mx, my, delta, blocked)
     end
 end)
 
+-- load everything for the character you're logged in as (on load, login and
+-- character change): lifetime, history, zone stats, imports, settings
 local function switch_character()
     local p = windower.ffxi.get_player()
     local name = p and p.name or nil
@@ -1980,8 +2135,8 @@ local function switch_character()
     S.pending, S.last_dig_t, last_find = nil, nil, nil
     load_life()
     load_history()
-    load_zone_stats()
-    load_community()
+    Z.load()
+    Z.load_community()
     for name in pairs(all_dug_names()) do register_dug(name) end -- any character's digs
     roll_day()
     apply_settings()
@@ -1994,10 +2149,12 @@ config.register(settings, function(new_settings)
     apply_settings()
 end)
 
+-- Logging in: load that character once its data is available.
 windower.register_event('login', function()
     coroutine.schedule(switch_character, 3) -- player data isn't ready instantly
 end)
 
+-- The addon was just loaded: say hello and load the current character.
 windower.register_event('load', function()
     log(('Author: %s, Version %s'):format('Valdimar @ Phoenix', _addon.version))
     switch_character()
@@ -2007,70 +2164,217 @@ end)
 ---------------------------------------------------------------------------
 -- Commands
 ---------------------------------------------------------------------------
-local function help()
-    for _, l in ipairs({
-        'start | stop | pause   - control auto-digging (tracker always runs)',
-        'reset                  - reset session stats',
-        'status                 - print summary to chat',
-        'distance <yalms>       - distance required between digs',
-        'turn <yalms>           - distance to move after turning off undiggable ground',
-        'settle <seconds>       - wait after each dig before turning and moving (default 2.5)',
-        'badlimit <n>           - stop and alert after n failed digs in a row (default 7, 0 = never)',
-        'stopecho <text>        - extra line echoed with that alert (stopecho off = none)',
-        'turnchance <0-100>     - % chance to turn after a dig instead of carrying on (default 50)',
-        'area <yalms>           - stay within this distance of where auto-dig started (0 = no limit)',
-        'anchor                 - make your current spot the centre of the digging area',
-        'timer <seconds>        - base seconds between digs',
-        'jitter <seconds>       - random +/- added to timer',
-        'max <count>            - auto-stop after N finds (0 = off)',
-        'cap <count>            - your daily fatigue cap (100 rental; up to ~200 raised)',
-        'fatigue [n|reset]      - show / set / reset today\'s fatigue count',
-        'stopfatigue on|off     - auto-stop when the cap is reached',
-        'slots <n>              - auto-stop at n free inventory slots or fewer (0 = off)',
-        'mount on|off           - require being mounted',
-        'wing [level]           - show / set your Wing Skill (skill-ups in chat keep it updated)',
-        'hyper on|off|test      - set or re-test the Hyper Chocobo Digging Campaign (tested on every start)',
-        'hyper <dates>          - save campaign dates, e.g. hyper Oct16-Nov9 (hyper dates / hyper dates clear)',
-        'history [days|date]    - daily dig log (e.g. history 14, history 20261101)',
-        'prices clean           - remove prices for items no character has dug up',
-        'zonewin [on|off]       - show/hide the zone stats window (or click ZONES)',
-        'import [file|list|clear] - add other players\' exports from data/import/',
-        'compact [on|off]       - show only the key rows',
-        'items [on|off]         - hide/show the item list (or click ITEMS FOUND)',
-        'lock [on|off]          - stop the panel being dragged',
-        'tune [on|off]          - self-tuning no-result wait (shows measured result times)',
-        'zone [all]             - drop stats for this zone (or every zone) at your Wing rank',
-        'export                 - write all characters\' zone drop stats to a shareable report + CSV',
-        'debug on|off           - log dig chat + BirdUp decisions to a new dated file',
-        'warn <greens> <slots>  - flash the panel at this many greens / free slots (default 10 5)',
-        'hud                    - show/hide the display',
-        'reload                 - save everything and reload BirdUp',
-        'autohide on|off        - only show the display while on a chocobo',
-        'spacing <pixels>       - space from one display line to the next',
-        'view today|lifetime    - which item totals the HUD list shows',
-        'finds                  - print the full item list to chat',
-        'currency               - lifetime/today conquest points, Imperial Standing, allied notes, bayld',
-        'price <item> <gil>     - set an item\'s price by hand (0 clears)',
-        'prices                 - list known prices and gil earned from sales',
-        'profile                - show this character\'s saved settings',
-        'saveall                - copy current settings to all characters',
-        '(settings and lifetime stats are saved per character)',
-    }) do log(l) end
+
+-- Every setting you can change with //bup set <name> <value>.
+-- {name, settings key, kind, description, extra}; kind: num / pct / onoff / text.
+-- Old one-word commands (//bup distance 6, //bup cap 150...) still work.
+local SETTINGS = {
+    groups = {
+        {'Auto-dig', {
+            {'distance',    'required_distance', 'num',   'yalms to travel between digs'},
+            {'area',        'roam_radius',       'num',   'stay within this many yalms of the start (0 = no limit)'},
+            {'turnchance',  'turn_chance',       'pct',   '% chance to turn after a dig'},
+            {'turn',        'turn_distance',     'num',   'yalms to move after undiggable ground'},
+            {'settle',      'result_buffer',     'num',   'seconds after a dig result before moving'},
+            {'timer',       'extra_wait',        'num',   'extra seconds on top of the dig cooldown'},
+            {'jitter',      'jitter',            'num',   'up to this many random extra seconds per wait'},
+            {'tune',        'auto_tune',         'onoff', 'self-tuning no-result wait'},
+        }},
+        {'Stopping', {
+            {'max',         'max_success',       'num',   'stop after this many finds today (0 = never)'},
+            {'cap',         'fatigue_cap',       'num',   'your daily fatigue cap'},
+            {'stopfatigue', 'stop_at_fatigue',   'onoff', 'stop at the fatigue cap'},
+            {'slots',       'min_free_slots',    'num',   'stop at this many free bag slots (0 = off)'},
+            {'badlimit',    'bad_ground_limit',  'num',   'stop after this many failed digs in a row (0 = never)'},
+            {'stopecho',    'stop_echo',         'text',  'extra line echoed when that happens ("off" = none)'},
+            {'mount',       'require_mount',     'onoff', 'stop when not on a chocobo'},
+        }},
+        {'Panel', {
+            {'autohide',    'auto_hide',         'onoff', 'only show the panel while on a chocobo'},
+            {'warngreens',  'warn_greens',       'num',   'flash the panel at this many greens (0 = off)'},
+            {'warnslots',   'warn_slots',        'num',   'flash the panel at this many free slots (0 = off)'},
+            {'spacing',     'line_spacing',      'num',   'pixels between panel lines'},
+        }},
+    },
+    by_name = {},
+}
+function SETTINGS.index() -- (in a function: loop variables don't count toward the top-level limit)
+    for _, g in ipairs(SETTINGS.groups) do
+        for _, d in ipairs(g[2]) do SETTINGS.by_name[d[1]] = d end
+    end
+end
+SETTINGS.index()
+
+-- on / off / toggle from a word ("on", "off", "true", "1"...); nil word = toggle
+function SETTINGS.bool(word, current)
+    word = (word or ''):lower()
+    if word == 'on' or word == 'true' or word == 'yes' or word == '1' then return true end
+    if word == 'off' or word == 'false' or word == 'no' or word == '0' then return false end
+    if word == '' or word == 'toggle' then return not current end
+    return nil
 end
 
-local function set_num(key, arg, label)
-    local n = tonumber(arg)
-    if not n or n < 0 then log('Usage: //bup ' .. label .. ' <number>') return end
-    settings[key] = n
+-- a setting's current value as text: on/off, 50%, "text" or a number
+function SETTINGS.show_value(d)
+    local v = settings[d[2]]
+    if d[3] == 'onoff' then return v and 'on' or 'off' end
+    if d[3] == 'pct' then return tostring(v) .. '%' end
+    if d[3] == 'text' then return (v and v ~= '') and ('"' .. v .. '"') or '(none)' end
+    return tostring(v)
+end
+
+-- //bup set with nothing after it: every setting, grouped, with its value
+function SETTINGS.show()
+    log(('Settings for %s (//bup set <name> <value>):'):format(char_name or '?'))
+    for _, g in ipairs(SETTINGS.groups) do
+        log(g[1] .. ':')
+        for _, d in ipairs(g[2]) do
+            local v = SETTINGS.show_value(d)
+            if #v > 24 then v = v:sub(1, 21) .. '..."' end -- long text: //bup set <name> shows it all
+            log(('  %-12s %-10s %s'):format(d[1], v, d[4]))
+        end
+    end
+end
+
+-- //bup set <name> <value...>
+function SETTINGS.set(name, args)
+    local d = SETTINGS.by_name[(name or ''):lower()]
+    if not d then
+        if not name or name == '' then return SETTINGS.show() end
+        local names = {}
+        for _, g in ipairs(SETTINGS.groups) do for _, x in ipairs(g[2]) do names[#names + 1] = x[1] end end
+        log(('No setting called "%s". Settings: %s. (//bup set lists them with values.)'):format(name, table.concat(names, ', ')))
+        return
+    end
+    local raw = table.concat(args, ' ')
+    if raw == '' and d[3] ~= 'onoff' then
+        log(('%s is %s (%s).'):format(d[1], SETTINGS.show_value(d), d[4]))
+        return
+    end
+    if d[3] == 'onoff' then
+        local v = SETTINGS.bool(args[1], settings[d[2]])
+        if v == nil then log(('Usage: //bup set %s on|off'):format(d[1])) return end
+        settings[d[2]] = v
+    elseif d[3] == 'text' then
+        settings[d[2]] = raw:lower() == 'off' and '' or raw
+    else
+        local n = tonumber(args[1])
+        if not n or n < 0 or (d[3] == 'pct' and n > 100) then
+            log(('Usage: //bup set %s <%s>'):format(d[1], d[3] == 'pct' and '0-100' or 'number'))
+            return
+        end
+        settings[d[2]] = n
+    end
     config.save(settings)
-    log(('%s set to %s'):format(label, n))
+    if d[2] == 'auto_hide' then refresh_visibility(true) end
+    hud_last = 0
+    log(('%s: %s'):format(d[1], SETTINGS.show_value(d)))
 end
 
-windower.register_event('addon command', function(cmd, ...)
-    cmd = cmd and cmd:lower() or 'help'
-    local a = {...}
+-- panel switches: //bup hud | compact | items | lock | zones [on|off]
+SETTINGS.panel = {
+    hud     = {'hud_visible',    'Panel'},
+    compact = {'compact',        'Compact mode'},
+    items   = {'collapse_items', 'Item list collapsed'},
+    lock    = {'locked',         'Panel lock'},
+    zones   = {'zone_window',    'Zone stats window'},
+    zonewin = {'zone_window',    'Zone stats window'},   -- older name
+}
 
-    if cmd == 'reload' then
+-- //bup help [topic]: a short overview, details per topic
+SETTINGS.help_text = {
+    overview = {
+        'BirdUp commands (//bup ...). For details: //bup help dig | info | share | panel | set',
+        '  start / stop / pause      control auto-digging',
+        '  status  finds  history  zone  prices  currency  wing    information',
+        '  hyper  anchor  fatigue                                  while digging',
+        '  export  import  debug                                   sharing and troubleshooting',
+        '  hud  compact  items  lock  zones  view                  the panel',
+        '  set [name value]          see or change any setting',
+        '  reload  reset  saveall                                  housekeeping',
+    },
+    dig = {
+        'start / stop / pause    start, stop or pause auto-digging (or use the panel buttons)',
+        'anchor                  center the digging area on where you are now',
+        'fatigue [n | reset]     show, set or reset today\'s fatigue count',
+        'wing [level]            show or set your Wing Skill (skill-ups in chat update it)',
+        'hyper                   show the Hyper Campaign status',
+        'hyper Oct16-Nov9        save campaign dates (hyper dates / hyper dates clear)',
+        'hyper on | off | auto   force it on/off until reload, or go back to testing',
+        'tune                    show measured dig-result times and the no-result wait',
+    },
+    info = {
+        'status                  one-line summary of this session',
+        'finds                   every item in the panel list, in chat',
+        'history [days | date]   daily log: history, history 14, history 20261110, history today',
+        'zone [all]              drop rates here (or everywhere) at your Wing rank',
+        'prices                  vendor prices, per city',
+        'price <item> <gil>      set a price by hand (0 clears)',
+        'prices clean            drop prices for items no character has dug',
+        'currency                conquest points, Imperial Standing, allied notes, bayld',
+    },
+    share = {
+        'export                  write your zone drop stats to a shareable .csv + .txt',
+        'import [file]           add other players\' exports from data/import/',
+        'import list | clear     list or remove imported players',
+        'debug on | off          record dig chat to a dated file (ends with unrecognized lines)',
+    },
+    panel = {
+        'hud [on|off]            show or hide the panel',
+        'compact [on|off]        only the key rows',
+        'items [on|off]          collapse the item list (or click ITEMS FOUND)',
+        'lock [on|off]           stop the panel being dragged',
+        'zones [on|off]          the zone stats window (or click ZONES)',
+        'view today | lifetime   which totals the item list shows',
+        'Without on/off, each of these switches between the two.',
+    },
+}
+
+-- //bup help [topic]
+function SETTINGS.help(topic)
+    topic = (topic or ''):lower()
+    if topic == 'set' or topic == 'settings' then return SETTINGS.show() end
+    for _, l in ipairs(SETTINGS.help_text[topic] or SETTINGS.help_text.overview) do log(l) end
+end
+
+-- //bup commands: one small function per command (keeps each under LuaJIT's
+-- 60-outside-variable limit). Each entry: {matches(cmd, a), run(cmd, a)}.
+local COMMANDS = {}
+-- //bup help [topic]
+COMMANDS[#COMMANDS + 1] = {function(cmd, a) return cmd == 'help' or cmd == '?' end, function(cmd, a)
+    SETTINGS.help(a[1])
+end}
+-- //bup set [name [value]] (also 'settings', and the old 'profile')
+COMMANDS[#COMMANDS + 1] = {function(cmd, a) return cmd == 'set' or cmd == 'settings' or cmd == 'profile' end, function(cmd, a)
+    local name = table.remove(a, 1)
+    SETTINGS.set(name, a)
+end}
+-- old one-word setting commands: //bup distance 6 == //bup set distance 6
+COMMANDS[#COMMANDS + 1] = {function(cmd, a) return SETTINGS.by_name[cmd] ~= nil and cmd ~= 'tune' end, function(cmd, a)
+    SETTINGS.set(cmd, a)
+end}
+-- older two-number form: //bup warn <greens> <slots>
+COMMANDS[#COMMANDS + 1] = {function(cmd, a) return cmd == 'warn' end, function(cmd, a)
+    if a[1] then SETTINGS.set('warngreens', {a[1]}) end
+    if a[2] then SETTINGS.set('warnslots', {a[2]}) end
+    if not a[1] then
+        log(('Panel warnings at %d greens and %d free slots (0 = off).'):format(settings.warn_greens, settings.warn_slots))
+    end
+end}
+-- //bup hud | compact | items | lock | zones [on|off]
+COMMANDS[#COMMANDS + 1] = {function(cmd, a) return SETTINGS.panel[cmd] ~= nil end, function(cmd, a)
+    local t = SETTINGS.panel[cmd]
+    local v = SETTINGS.bool(a[1], settings[t[1]])
+    if v == nil then log(('Usage: //bup %s [on|off]'):format(cmd)) return end
+    settings[t[1]] = v
+    config.save(settings)
+    if cmd == 'hud' then refresh_visibility(true) end
+    hud_last = 0
+    log(('%s: %s%s'):format(t[2], v and 'on' or 'off',
+        (cmd == 'hud' and v and settings.auto_hide) and ' (shows while on a chocobo; //bup set autohide off to always show)' or ''))
+end}
+-- //bup reload: save everything, then reload the addon
+COMMANDS[#COMMANDS + 1] = {function(cmd, a) return cmd == 'reload' end, function(cmd, a)
         if S.running then stop_addon('reloading.') end
         save_life(true)          -- lifetime + today's history
         save_prices()
@@ -2078,73 +2382,43 @@ windower.register_event('addon command', function(cmd, ...)
         log('Reloading...')
         windower.send_command('lua reload ' .. _addon.name)
         return
-    elseif cmd == 'start' then
+end}
+-- //bup start (same as the START button)
+COMMANDS[#COMMANDS + 1] = {function(cmd, a) return cmd == 'start' end, function(cmd, a)
         start_addon()
-    elseif cmd == 'stop' then
+end}
+-- //bup stop (same as the STOP button)
+COMMANDS[#COMMANDS + 1] = {function(cmd, a) return cmd == 'stop' end, function(cmd, a)
         stop_addon(nil)
-    elseif cmd == 'pause' then
+end}
+-- //bup pause: pause or resume auto-dig
+COMMANDS[#COMMANDS + 1] = {function(cmd, a) return cmd == 'pause' end, function(cmd, a)
         if not S.running then log('Not running.') return end
         S.paused = not S.paused
         stop_moving()
         auto_wait = nil
         if hyper_test == 'probing' then hyper_test = 'probe_next' end
         log(S.paused and 'Paused.' or 'Resumed.')
-    elseif cmd == 'reset' then
+end}
+-- //bup reset: clear this session's counters (today's items and fatigue stay)
+COMMANDS[#COMMANDS + 1] = {function(cmd, a) return cmd == 'reset' end, function(cmd, a)
         S.attempts, S.successes, S.fails, S.free, S.drops, S.first_dig, S.cur, S.gil = 0, 0, 0, 0, {}, nil, {}, 0
     S.discern = 0
         log('Session stats reset. (Today\'s items and daily fatigue are kept; they clear at midnight JST.)')
-    elseif cmd == 'status' then
+end}
+-- //bup status: one-line summary
+COMMANDS[#COMMANDS + 1] = {function(cmd, a) return cmd == 'status' end, function(cmd, a)
         log(('running=%s attempts=%d finds=%d misses=%d discern=%d hyper=%s greens=%s inventory=%s/%s'):format(
             tostring(S.running), S.attempts, S.successes, S.fails, S.discern, tostring(S.hyper), tostring(greens),
             tostring(inv_used), tostring(inv_max)))
-    elseif cmd == 'distance' then set_num('required_distance', a[1], 'distance')
-    elseif cmd == 'turn'     then set_num('turn_distance', a[1], 'turn')
-    elseif cmd == 'settle'   then set_num('dig_settle', a[1], 'settle')
-    elseif cmd == 'badlimit' then set_num('bad_ground_limit', a[1], 'badlimit')
-    elseif cmd == 'warn' then
-        local g, sl = tonumber(a[1] or ''), tonumber(a[2] or '')
-        if g then settings.warn_greens = math.max(0, math.floor(g)) end
-        if sl then settings.warn_slots = math.max(0, math.floor(sl)) end
-        config.save(settings)
-        log(('Panel warnings at %d greens and %d free slots (0 = off).'):format(settings.warn_greens, settings.warn_slots))
-    elseif cmd == 'stopecho' then
-        local text = table.concat(a, ' ')
-        if text == '' then log('Alert echo: ' .. (settings.stop_echo ~= '' and settings.stop_echo or '(none)')) return end
-        settings.stop_echo = text:lower() == 'off' and '' or text
-        config.save(settings)
-        log('Alert echo: ' .. (settings.stop_echo ~= '' and settings.stop_echo or '(none)'))
-    elseif cmd == 'turnchance' then
-        local n = tonumber(a[1])
-        if not n or n < 0 or n > 100 then log('Usage: //bup turnchance <0-100>') return end
-        settings.turn_chance = n
-        config.save(settings)
-        log(('Turn chance after each dig: %d%%.'):format(n))
-    elseif cmd == 'area'     then set_num('roam_radius', a[1], 'area')
-    elseif cmd == 'anchor' then
+end}
+-- //bup anchor: center the digging area here
+COMMANDS[#COMMANDS + 1] = {function(cmd, a) return cmd == 'anchor' end, function(cmd, a)
         anchor = get_pos()
-        log(anchor and ('Digging area centred here (%d yalm radius).'):format(settings.roam_radius) or 'Position unknown.')
-    elseif cmd == 'timer'    then set_num('dig_interval', a[1], 'timer')
-    elseif cmd == 'jitter'   then set_num('jitter', a[1], 'jitter')
-    elseif cmd == 'max'      then set_num('max_success', a[1], 'max')
-    elseif cmd == 'cap'      then set_num('fatigue_cap', a[1], 'cap')
-    elseif cmd == 'slots'    then set_num('min_free_slots', a[1], 'slots')
-    elseif cmd == 'mount' then
-        settings.require_mount = (a[1] or ''):lower() ~= 'off'
-        config.save(settings)
-        log('Require mount: ' .. tostring(settings.require_mount))
-    elseif cmd == 'hud' then
-        settings.hud_visible = not settings.hud_visible
-        config.save(settings)
-        refresh_visibility(true)
-        log('Display ' .. (settings.hud_visible and ('on' .. (settings.auto_hide and ' (shows while on a chocobo)' or '')) or 'off') .. '.')
-    elseif cmd == 'autohide' then
-        settings.auto_hide = (a[1] or ''):lower() ~= 'off'
-        config.save(settings)
-        refresh_visibility(true)
-        log('Auto-hide: ' .. (settings.auto_hide and 'on (display shows only while on a chocobo)' or 'off (display always shown)'))
-    elseif cmd == 'spacing' then
-        set_num('line_spacing', a[1], 'spacing')
-    elseif cmd == 'fatigue' then
+        log(anchor and ('Digging area centered here (%d yalm radius).'):format(settings.roam_radius) or 'Position unknown.')
+end}
+-- //bup fatigue [n | reset]
+COMMANDS[#COMMANDS + 1] = {function(cmd, a) return cmd == 'fatigue' end, function(cmd, a)
         roll_day()
         if a[1] and a[1]:lower() == 'reset' then
             life.fatigue, life.free, life_dirty = 0, 0, true
@@ -2161,11 +2435,9 @@ windower.register_event('addon command', function(cmd, ...)
             log(('Fatigue today: %d / %d (%d free digs). Resets at midnight JST.'):format(
                 life.fatigue, settings.fatigue_cap, life.free))
         end
-    elseif cmd == 'stopfatigue' then
-        settings.stop_at_fatigue = (a[1] or ''):lower() ~= 'off'
-        config.save(settings)
-        log('Auto-stop at fatigue cap: ' .. tostring(settings.stop_at_fatigue))
-    elseif cmd == 'price' then
+end}
+-- //bup price <item> <gil>: set a price by hand (0 clears)
+COMMANDS[#COMMANDS + 1] = {function(cmd, a) return cmd == 'price' end, function(cmd, a)
         local n = tonumber(a[#a])
         if #a < 2 or not n or n < 0 then log('Usage: //bup price <item name> <gil each>  (0 clears it)') return end
         local id = item_id_for(table.concat(a, ' ', 1, #a - 1))
@@ -2181,15 +2453,20 @@ windower.register_event('addon command', function(cmd, ...)
         else
             log(('Price history: %s added at %s gil each.'):format(canon, commas(n)))
         end
-    elseif cmd == 'prices' and (a[1] or ''):lower() == 'clean' then
+end}
+-- //bup prices clean: drop prices for items no character has dug
+COMMANDS[#COMMANDS + 1] = {function(cmd, a) return cmd == 'prices' and (a[1] or ''):lower() == 'clean' end, function(cmd, a)
         local dug = all_dug_names() -- items any character has dug up
         local removed = {}
         for name in pairs(prices) do if not dug[name] then removed[#removed + 1] = name end end
         for _, name in ipairs(removed) do prices[name] = nil end
+        for name in pairs(cprices) do if not dug[name] then cprices[name] = nil end end
         save_prices()
         log(('Removed %d price%s for items nobody has dug up%s'):format(#removed, #removed == 1 and '' or 's',
             #removed > 0 and (': ' .. table.concat(removed, ', ')) or '.'))
-    elseif cmd == 'debug' then
+end}
+-- //bup debug on | off
+COMMANDS[#COMMANDS + 1] = {function(cmd, a) return cmd == 'debug' end, function(cmd, a)
         local v = (a[1] or ''):lower()
         if v == 'on' then
             if debug_f then log('Debug log already on: ' .. debug_path) return end
@@ -2200,48 +2477,44 @@ windower.register_event('addon command', function(cmd, ...)
             if not debug_f then log('Could not create the debug file.') return end
             debug_f:write(('BirdUp %s debug log, started %s\n'):format(_addon.version, os.date('%Y-%m-%d %H:%M:%S')))
             debug_f:write(('Zone: %s | Wing Skill: %s | Hyper: %s\n\n'):format(
-                zone_name(current_zone()), tostring(life.wing), tostring(S.hyper)))
+                Z.zone_name(Z.current_zone()), tostring(life.wing), tostring(S.hyper)))
             debug_f:flush()
             log('Debug log on: addons/birdup/' .. debug_path .. ' (chat while auto-digging or near a dig, plus BirdUp\'s decisions).')
         elseif v == 'off' then
             if not debug_f then log('Debug log is off.') return end
-            dbg('END', 'debug off')
-            debug_f:close()
-            debug_f = nil
-            log('Debug log saved: addons/birdup/' .. debug_path)
+            local n = debug_unknown.close('debug off')
+            log(('Debug log saved: addons/birdup/%s%s'):format(debug_path,
+                n > 0 and (' (%d unrecognized line%s listed at the end)'):format(n, n == 1 and '' or 's') or ''))
         else
             log(debug_f and ('Debug log on: addons/birdup/' .. debug_path) or 'Debug log off. //bup debug on to start one.')
         end
-    elseif cmd == 'compact' or cmd == 'lock' or cmd == 'items' then
-        local key = ({compact = 'compact', lock = 'locked', items = 'collapse_items'})[cmd]
+end}
+-- //bup tune [on|off]: measured result times and the current no-result wait
+COMMANDS[#COMMANDS + 1] = {function(cmd, a) return cmd == 'tune' end, function(cmd, a)
         local v = (a[1] or ''):lower()
-        if v == 'on' then settings[key] = true elseif v == 'off' then settings[key] = false
-        else settings[key] = not settings[key] end
-        config.save(settings)
-        hud_last = 0
-        local names = {compact = 'Compact mode', locked = 'Panel lock', collapse_items = 'Item list hidden'}
-        log(names[key] .. ': ' .. (settings[key] and 'on' or 'off') .. '.')
-    elseif cmd == 'tune' then
-        local v = (a[1] or ''):lower()
-        if v == 'on' then settings.auto_tune = true; config.save(settings)
-        elseif v == 'off' then settings.auto_tune = false; config.save(settings) end
+        if v ~= '' then
+            local b = SETTINGS.bool(v, settings.auto_tune)
+            if b ~= nil then settings.auto_tune = b; config.save(settings) end
+        end
         local avg = 0
         for _, x in ipairs(latency) do avg = avg + x end
         avg = #latency > 0 and avg / #latency or 0
         log(('Auto-tune %s. Results measured: %d (avg %.1fs). No-result wait now %.1fs%s.'):format(
             settings.auto_tune and 'on' or 'off', #latency, avg, result_wait(),
             (settings.auto_tune and #latency < 5) and ' (needs 5 digs to start tuning)' or ''))
-    elseif cmd == 'import' then
+end}
+-- //bup import [file | list | clear]
+COMMANDS[#COMMANDS + 1] = {function(cmd, a) return cmd == 'import' end, function(cmd, a)
         local v = a[1] or ''
         local imp = windower.addon_path .. 'data/import/'
         windower.create_dir(windower.addon_path .. 'data')
         windower.create_dir(imp)
         if v:lower() == 'list' then
             local n = 0
-            for _, file in ipairs(windower.get_dir(community_dir()) or {}) do
+            for _, file in ipairs(windower.get_dir(Z.community_dir()) or {}) do
                 if file:match('%.txt$') then
                     local one = {}
-                    read_zone_file(community_dir() .. file, one)
+                    Z.read_zone_file(Z.community_dir() .. file, one)
                     local digs, zones = 0, 0
                     for _, ranks in pairs(one) do zones = zones + 1; for _, e in pairs(ranks) do digs = digs + e.digs end end
                     log(('  player %s: %s digs in %d zone%s'):format(file:gsub('%.txt$', ''), commas(digs), zones, zones == 1 and '' or 's'))
@@ -2252,10 +2525,10 @@ windower.register_event('addon command', function(cmd, ...)
             return
         elseif v:lower() == 'clear' then
             local n = 0
-            for _, file in ipairs(windower.get_dir(community_dir()) or {}) do
-                if file:match('%.txt$') and os.remove(community_dir() .. file) then n = n + 1 end
+            for _, file in ipairs(windower.get_dir(Z.community_dir()) or {}) do
+                if file:match('%.txt$') and os.remove(Z.community_dir() .. file) then n = n + 1 end
             end
-            load_community()
+            Z.load_community()
             log(('Removed %d imported player%s. Your own stats are untouched.'):format(n, n == 1 and '' or 's'))
             return
         end
@@ -2275,28 +2548,32 @@ windower.register_event('addon command', function(cmd, ...)
         end
         local ok_n = 0
         for _, file in ipairs(files) do
-            local ok, msg = import_file(imp .. file, file)
+            local ok, msg = Z.import_file(imp .. file, file)
             log((ok and 'Imported ' or 'Skipped ') .. msg)
             if ok then ok_n = ok_n + 1 end
         end
-        load_community()
+        Z.load_community()
         hud_last = 0
         if ok_n > 0 then log('The zone window and //bup zone now show all players next to your own rates.') end
-    elseif cmd == 'zonewin' then
-        local v = (a[1] or ''):lower()
-        if v == 'on' then settings.zone_window = true
-        elseif v == 'off' then settings.zone_window = false
-        else settings.zone_window = not settings.zone_window end
-        config.save(settings)
-        hud_last = 0
-        log('Zone stats window ' .. (settings.zone_window and 'shown.' or 'hidden.'))
-    elseif cmd == 'zone' then
+end}
+-- //bup zone window [on|off]
+COMMANDS[#COMMANDS + 1] = {function(cmd, a) return cmd == 'zone' and ((a[1] or ''):lower() == 'window' or (a[1] or ''):lower() == 'win') end, function(cmd, a)
+    local v = SETTINGS.bool(a[2], settings.zone_window)
+    if v == nil then log('Usage: //bup zone window [on|off]') return end
+    settings.zone_window = v
+    config.save(settings)
+    hud_last = 0
+    log('Zone stats window: ' .. (v and 'on' or 'off'))
+end}
+-- //bup zone [all]: drop stats here (or everywhere) at your Wing rank
+COMMANDS[#COMMANDS + 1] = {function(cmd, a) return cmd == 'zone' end, function(cmd, a)
+        -- print one zone's stats per Wing rank, top items with their rates
         local function summary(zid, ranks)
             for rank, e in pairs(ranks) do
                 if e.digs > 0 then
-                    log(('%s (%s): %d digs, %d finds (%d%%), %d miss, %d discern'):format(zone_name(zid), rank,
+                    log(('%s (%s): %d digs, %d finds (%d%%), %d miss, %d discern'):format(Z.zone_name(zid), rank,
                         e.digs, e.finds, math.floor(e.finds / e.digs * 100 + 0.5), e.miss, e.discern))
-                    local all = combined_entry(zid, rank)
+                    local all = Z.combined(zid, rank)
                     if all then
                         log(('  All players: %s digs, %d%% hit. Columns: yours, then all players.'):format(
                             commas(all.digs), math.floor(all.finds / all.digs * 100 + 0.5)))
@@ -2313,27 +2590,29 @@ windower.register_event('addon command', function(cmd, ...)
         end
         if (a[1] or ''):lower() == 'all' then
             local n = 0
-            for zid, ranks in pairs(zstats) do summary(zid, ranks); n = n + 1 end
+            for zid, ranks in pairs(Z.stats()) do summary(zid, ranks); n = n + 1 end
             if n == 0 then log('No zone stats yet.') end
         else
-            local zid = current_zone()
-            if not zid or not zstats[zid] then log('No digs recorded in this zone yet.') return end
-            summary(zid, zstats[zid])
+            local zid = Z.current_zone()
+            if not zid or not Z.stats()[zid] then log('No digs recorded in this zone yet.') return end
+            summary(zid, Z.stats()[zid])
         end
-    elseif cmd == 'export' then
+end}
+-- //bup export: all characters' zone stats -> data/export/*.csv + *.txt
+COMMANDS[#COMMANDS + 1] = {function(cmd, a) return cmd == 'export' end, function(cmd, a)
         -- combine every character's zone stats into one shareable report + CSV
         save_life(true)
         local all, chars = {}, 0
         local dir = windower.addon_path .. 'data/'
         for _, file in ipairs(windower.get_dir(dir) or {}) do
-            if file:match('^zones_.+%.txt$') then read_zone_file(dir .. file, all); chars = chars + 1 end
+            if file:match('^zones_.+%.txt$') then Z.read_zone_file(dir .. file, all); chars = chars + 1 end
         end
         local rows_out, total_digs, zones_n = {}, 0, 0
         local rank_order = {}
-        for i, w in ipairs(WING_RANKS) do rank_order[w[1]] = i end
+        for i, w in ipairs(K.WING_RANKS) do rank_order[w[1]] = i end
         local zids = {}
         for zid in pairs(all) do zids[#zids + 1] = zid end
-        table.sort(zids, function(x, y) return zone_name(x) < zone_name(y) end)
+        table.sort(zids, function(x, y) return Z.zone_name(x) < Z.zone_name(y) end)
         if #zids == 0 then log('Nothing to export yet: dig somewhere first.') return end
         windower.create_dir(dir .. 'export')
         local stamp = os.date('%Y%m%d_%H%M%S')
@@ -2341,9 +2620,10 @@ windower.register_event('addon command', function(cmd, ...)
         local csv = io.open(windower.addon_path .. csv_rel, 'w')
         local txt = io.open(windower.addon_path .. txt_rel, 'w')
         if not csv or not txt then log('Could not write the export files.') return end
+        -- quote a CSV field if it contains a comma or quote
         local function q(v) v = tostring(v); return v:find('[,"]') and ('"' .. v:gsub('"', '""') .. '"') or v end
         csv:write('zone,wing_rank,zone_digs,zone_finds,zone_miss,zone_discern,item,count,percent_of_digs,vendor_price,source_id\n')
-        local sid = get_my_id()
+        local sid = Z.get_my_id()
         local lines = {}
         for _, zid in ipairs(zids) do
             zones_n = zones_n + 1
@@ -2355,13 +2635,13 @@ windower.register_event('addon command', function(cmd, ...)
                 if e.digs > 0 then
                     total_digs = total_digs + e.digs
                     lines[#lines + 1] = ('%s  |  Wing rank: %s  |  %d digs, %d finds (%.1f%%), %d miss, %d discern'):format(
-                        zone_name(zid), rank, e.digs, e.finds, e.finds / e.digs * 100, e.miss, e.discern)
+                        Z.zone_name(zid), rank, e.digs, e.finds, e.finds / e.digs * 100, e.miss, e.discern)
                     local list = {}
                     for item, n in pairs(e.items) do list[#list + 1] = {item, n} end
                     table.sort(list, function(x, y) return x[2] > y[2] end)
                     for _, it in ipairs(list) do
                         local pct = it[2] / e.digs * 100
-                        csv:write(('%s,%s,%d,%d,%d,%d,%s,%d,%.2f,%s,%s\n'):format(q(zone_name(zid)), q(rank), e.digs, e.finds,
+                        csv:write(('%s,%s,%d,%d,%d,%d,%s,%d,%.2f,%s,%s\n'):format(q(Z.zone_name(zid)), q(rank), e.digs, e.finds,
                             e.miss, e.discern, q(it[1]), it[2], pct, prices[it[1]] and tostring(prices[it[1]]) or '', sid))
                         lines[#lines + 1] = ('    %-28s %6d   %6.2f%%%s'):format(it[1], it[2], pct,
                             prices[it[1]] and ('   ~' .. commas(prices[it[1]]) .. ' gil') or '')
@@ -2379,7 +2659,9 @@ windower.register_event('addon command', function(cmd, ...)
         csv:close(); txt:close()
         log(('Exported %d digs across %d zone%s to addons/birdup/%s and .txt'):format(
             total_digs, zones_n, zones_n == 1 and '' or 's', csv_rel))
-    elseif cmd == 'hyper' then
+end}
+-- //bup hyper [on | off | auto | <dates> | dates [clear]]
+COMMANDS[#COMMANDS + 1] = {function(cmd, a) return cmd == 'hyper' end, function(cmd, a)
         local v = (a[1] or ''):lower()
         local rest = table.concat(a, ' ', v == 'dates' and 2 or 1)
         if v == 'on' then S.hyper, hyper_test, hyper_mode = true, nil, 'on'
@@ -2411,7 +2693,9 @@ windower.register_event('addon command', function(cmd, ...)
         log(('Hyper Chocobo Digging Campaign: %s. Digging every %ds.'):format(
             hyper_test and 'will test on the next digs' or (hyper_on() and 'active' or (S.hyper == false and 'not active' or 'not tested')),
             dig_delay()))
-    elseif cmd == 'wing' then
+end}
+-- //bup wing [level]
+COMMANDS[#COMMANDS + 1] = {function(cmd, a) return cmd == 'wing' end, function(cmd, a)
         local n = tonumber(a[1] or '')
         if n then
             if n < 0 or n > 100 then log('Wing Skill goes from 0 to 100.') return end
@@ -2427,8 +2711,11 @@ windower.register_event('addon command', function(cmd, ...)
         else
             log('Wing Skill not seen yet. It updates when a skill-up shows in chat, or set it with //bup wing <level>.')
         end
-    elseif cmd == 'history' then
+end}
+-- //bup history [days | yyyymmdd | today]
+COMMANDS[#COMMANDS + 1] = {function(cmd, a) return cmd == 'history' end, function(cmd, a)
         today()
+        -- 20261110 -> '2026-11-10'
         local function day_str(d)
             d = tostring(d)
             return d:sub(1, 4) .. '-' .. d:sub(5, 6) .. '-' .. d:sub(7, 8)
@@ -2441,7 +2728,8 @@ windower.register_event('addon command', function(cmd, ...)
             log(('%s (JST): %d finds from %d digs, %d miss, %d discern, %d fatigue + %d free, %d session%s, %s digging, %s gil sold%s'):format(
                 day_str(one), e.finds, e.attempts, e.fails, e.discern or 0, e.fatigue, e.free, e.sessions,
                 e.sessions == 1 and '' or 's', fmt_time(e.secs), commas(e.gil),
-                e.wing and (', Wing Skill ' .. e.wing) or ''))
+                e.wing and (', Wing Skill ' .. e.wing) or '') ..
+                ((e.roe or 0) > 0 and (', %d RoE dig objective%s done'):format(e.roe, e.roe == 1 and '' or 's') or ''))
             for k, n in pairs(e.cur) do log(('  %-18s %s'):format(k == 'cp' and 'conquest points' or k, commas(n))) end
             local list = {}
             for name, n in pairs(e.drops) do list[#list + 1] = {name, n} end
@@ -2461,24 +2749,40 @@ windower.register_event('addon command', function(cmd, ...)
                     days[i] == life.day and '  (today)' or ''))
             end
         end
-    elseif cmd == 'prices' then
+end}
+-- //bup prices: every known price, with each city's price
+COMMANDS[#COMMANDS + 1] = {function(cmd, a) return cmd == 'prices' end, function(cmd, a)
         local list = {}
         for name, pr in pairs(prices) do list[#list + 1] = {name, pr} end
         table.sort(list, function(x, y) return x[2] > y[2] end)
         log(('Known prices (%d). Gil from sales: %s lifetime, %s today.'):format(
             #list, commas(life.gil), commas(today().gil)))
-        for _, e in ipairs(list) do log(('  %-28s %s gil'):format(e[1], commas(e[2]))) end
-    elseif cmd == 'currency' then
+        for _, e in ipairs(list) do
+            local by_city = {}
+            for c, n in pairs(cprices[e[1]] or {}) do by_city[#by_city + 1] = {c, n} end
+            table.sort(by_city, function(x, y) return x[2] > y[2] end)
+            local parts = {}
+            for _, c in ipairs(by_city) do parts[#parts + 1] = c[1] .. ' ' .. commas(c[2]) end
+            log(('  %-28s %s gil%s'):format(e[1], commas(e[2]),
+                #parts > 0 and ('  (' .. table.concat(parts, ', ') .. ')') or ''))
+        end
+end}
+-- //bup currency: lifetime and today's currency rewards
+COMMANDS[#COMMANDS + 1] = {function(cmd, a) return cmd == 'currency' end, function(cmd, a)
         local names = {cp = 'Conquest points', imperial = 'Imperial Standing', allied = 'Allied notes', bayld = 'Bayld'}
         for _, key in ipairs({'cp', 'imperial', 'allied', 'bayld'}) do
             log(('  %-18s lifetime %s, today %s'):format(names[key],
                 commas(life.cur[key] or 0), commas(today().cur[key] or 0)))
         end
-    elseif cmd == 'view' then
+end}
+-- //bup view today | lifetime: which totals the item list shows
+COMMANDS[#COMMANDS + 1] = {function(cmd, a) return cmd == 'view' end, function(cmd, a)
         settings.finds_view = (a[1] or ''):lower() == 'lifetime' and 'lifetime' or 'today'
         config.save(settings)
         log('Item list now shows: ' .. settings.finds_view)
-    elseif cmd == 'finds' then
+end}
+-- //bup finds: the item list in chat
+COMMANDS[#COMMANDS + 1] = {function(cmd, a) return cmd == 'finds' end, function(cmd, a)
         local src = settings.finds_view == 'lifetime' and life.drops or today().drops
         local list = {}
         for name, n in pairs(src) do list[#list + 1] = {name, n} end
@@ -2487,14 +2791,20 @@ windower.register_event('addon command', function(cmd, ...)
         for _, e in ipairs(list) do
             log(('  %-28s %5d%s'):format(e[1], e[2], prices[e[1]] and ('  @' .. short_price(prices[e[1]])) or ''))
         end
-    elseif cmd == 'saveall' then
+end}
+-- //bup saveall: copy this character's settings to every character
+COMMANDS[#COMMANDS + 1] = {function(cmd, a) return cmd == 'saveall' end, function(cmd, a)
         config.save(settings, 'all')
         log('Current settings copied to all characters.')
-    elseif cmd == 'profile' then
-        log(('Character: %s | timer %.1fs, jitter %.1fs, distance %.1fy, max %d, mount check %s'):format(
-            char_name or '?', settings.dig_interval, settings.jitter,
-            settings.required_distance, settings.max_success, tostring(settings.require_mount)))
-    else
-        help()
+end}
+
+-- //bup <command> ...: run the first matching entry in COMMANDS, else show help.
+windower.register_event('addon command', function(cmd, ...)
+    cmd = cmd and cmd:lower() or 'help'
+    local a = {...}
+    for _, c in ipairs(COMMANDS) do
+        if c[1](cmd, a) then return c[2](cmd, a) end
     end
+    log(('Unknown command "%s".'):format(cmd))
+    SETTINGS.help()
 end)
