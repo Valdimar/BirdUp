@@ -1,6 +1,6 @@
 _addon.name     = 'birdup'
 _addon.author   = 'Valdimar @ Phoenix' -- auto-dig based on Velner/chocodig
-_addon.version  = '3.9'
+_addon.version  = '4.0'
 _addon.commands = {'birdup', 'bup'}
 
 -- Says in chat when a newer version is on GitHub (once per load; see update_check.lua)

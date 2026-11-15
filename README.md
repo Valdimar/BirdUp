@@ -2,7 +2,7 @@
 
 A Windower 4 addon for Final Fantasy XI that automates chocobo digging and tracks everything about it: fatigue, free digs, inventory space, and every item you find. It combines the auto-dig behavior of [Velner/chocodig](https://github.com/Velner/chocodig) with dig tracking, all shown on one draggable HUD.
 
-**Author:** Valdimar @ Phoenix  **Version:** 3.9  **Commands:** `//birdup` or `//bup`
+**Author:** Valdimar @ Phoenix  **Version:** 4.0  **Commands:** `//birdup` or `//bup`
 
 > Status: untested release. Run short sessions first and watch the Windower console for Lua errors.
 
@@ -56,14 +56,19 @@ A Windower 4 addon for Final Fantasy XI that automates chocobo digging and track
 
 ## Update check
 
-A few seconds after you log in, BirdUp checks GitHub once for a newer version. If there is one,
-chat says so:
+A few seconds after you log in, BirdUp checks GitHub once and always reports the result in chat:
 
 ```
-[BirdUp] Version X.Y is out (you have 3.9). Get it from github.com/Valdimar/BirdUp
+[BirdUp] Up to date (version 4.0).
+[BirdUp] UPDATE AVAILABLE: version X.Y is out (you have 4.0). Get it from github.com/Valdimar/BirdUp
+[BirdUp] Version 4.0 is newer than GitHub (3.9), so it hasn't been released yet.
+[BirdUp] Couldn't check for updates (GitHub didn't answer). Try again with a reload.
 ```
 
-It only speaks up when GitHub has a newer version, and stays quiet if GitHub can't be reached.
+- **Up to date:** you have the latest version.
+- **UPDATE AVAILABLE:** a newer version is on GitHub. This line is shown in a different color so it stands out.
+- **Newer than GitHub:** your copy is ahead of the released version (for example, a test build).
+- **Couldn't check:** GitHub couldn't be reached, or HTTPS isn't available in your Windower. Reload BirdUp (`//bup reload`) to try again.
 The game can pause for a moment while it checks (at most 3 seconds, usually much less).
 
 ## Quick start
