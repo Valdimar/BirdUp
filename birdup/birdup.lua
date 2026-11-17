@@ -1,6 +1,6 @@
 _addon.name     = 'birdup'
 _addon.author   = 'Valdimar @ Phoenix' -- auto-dig based on Velner/chocodig
-_addon.version  = '4.1'
+_addon.version  = '4.2'
 _addon.commands = {'birdup', 'bup'}
 
 -- Says in chat when a newer version is on GitHub (once per load; see update_check.lua)
@@ -58,7 +58,8 @@ local K = {} -- constants (kept in one table: Lua allows only 200 top-level loca
 local defaults = {
     dig_interval      = 4,     -- (no longer used: the Wing Skill cooldown sets the pace)
     extra_wait        = 0,     -- extra seconds on top of the dig cooldown (//bup timer)
-    jitter            = 0.6,   -- up to this many random seconds added, so digs aren't perfectly regular
+    jitter            = 0.6,   -- (no longer used: see humanize)
+    humanize          = 0,     -- up to this many random extra seconds per dig (0 = dig right on the cooldown)
     required_distance = 5,     -- yalms (2D) to travel between digs
     move_timeout      = 8,
     turn_distance     = 3,     -- yalms to move after turning away from undiggable ground
@@ -66,6 +67,7 @@ local defaults = {
     result_buffer     = 0.3,   -- seconds after a dig result before turning and moving (//bup settle)
     turn_chance       = 50,    -- % chance to turn after a dig (otherwise keep going the same way)
     roam_radius       = 20,    -- stay within this many yalms of where auto-dig started (0 = no limit)
+    move_during_dig   = true,  -- dig on the cooldown and move during the dig animation (//bup set movedig)
     stop_settle       = 0.4,   -- seconds the chocobo must be standing still before a dig
     result_timeout    = 5,     -- used until auto_tune has enough measurements
     auto_tune         = true,  -- set the no-result wait from how fast results really arrive
@@ -1479,8 +1481,23 @@ local function bad_ground(why)
         end
         return
     end
+    -- a refused dig ("You cannot dig here.") never happened, so it doesn't start
+    -- the cooldown: the next dig can go as soon as the last real dig allows
+    if why ~= 'no result' then
+        if S.prev_wait then auto_wait, S.prev_wait = S.prev_wait, nil end -- the older dig is still coming
+        local last_real = math.max(last_ok_t, auto_wait or 0)
+        next_dig = math.max(os.clock(), last_real + dig_delay() + (S.pad or 0.15) + settings.extra_wait)
+    end
+    -- already moved on from that spot during the dig (movedig)? dig where we are
+    local here = get_pos()
+    local moved_on = here and last_dig_pos and dist2d(here, last_dig_pos) >= settings.turn_distance
     last_dig_pos = prev_dig_pos -- that spot wasn't a real dig
     retry_here = true
+    if moved_on then
+        log(('Can\'t dig there (%s); already moved on, digging here next. (%d/%d)'):format(
+            why, bad_streak, settings.bad_ground_limit))
+        return
+    end
     do
         log(('Can\'t dig here (%s). Turning around and trying a few yalms away. (%d/%d)'):format(
             why, bad_streak, settings.bad_ground_limit))
@@ -1505,13 +1522,16 @@ local function attempt_dig()
     prev_dig_pos, last_dig_pos = last_dig_pos, get_pos()
     retry_here = false
     need_spin = true
+    -- movedig: the previous dig's result may still be coming (results take ~4s,
+    -- the cooldown is shorter). Remember it so its result is matched to it.
+    if auto_wait then S.prev_wait = auto_wait end
     auto_wait = os.clock()
     if hyper_test == 'probe_next' then hyper_test = 'probing' end
-    -- never faster than the cooldown (Wing Skill, or the campaign's), plus a little slack
-    local wd = dig_delay()
-    -- the cooldown sets the pace; the move to the next spot happens inside it
-    local wait = wd + 0.3 + settings.extra_wait + math.random() * settings.jitter
-    next_dig = os.clock() + math.max(wd + 0.3, wait)
+    -- the next dig: right on the cooldown (Wing Skill or campaign) plus a small
+    -- margin that BirdUp learns from "You must wait longer" (S.pad)
+    S.pad = S.pad or 0.15
+    local margin = settings.move_during_dig and S.pad or 0.3
+    next_dig = os.clock() + dig_delay() + margin + settings.extra_wait + math.random() * settings.humanize
     windower.send_command('input /dig')
 end
 
@@ -1557,6 +1577,22 @@ end
 -- the game answered our dig: update the campaign test
 local function dig_answered()
     local now = os.clock()
+    -- movedig: two digs can be waiting. Results come back in the order the digs
+    -- were sent, so this one belongs to the older dig, unless the newer dig has
+    -- been out long enough to have answered itself.
+    if S.prev_wait then
+        local quickest = 2.5
+        for _, v in ipairs(latency) do if v < quickest / 0.8 then quickest = v * 0.8 end end
+        if now - S.prev_wait <= 12 and not (auto_wait and now - auto_wait >= quickest) then
+            add_latency(now - S.prev_wait)
+            last_ok_t = S.prev_wait
+            S.prev_wait = nil
+            bad_streak, blocked_count = 0, 0
+            S.pad = math.max(0.05, (S.pad or 0.15) - 0.02) -- going fine: trim the margin
+            return -- the newer dig is still waiting for its own result
+        end
+        S.prev_wait = nil
+    end
     -- Results arrive in the order digs were sent, so if we gave up on a dig
     -- less than 12s ago, this result is that dig's: it was just slow.
     -- ...unless the newer dig has been out long enough to have answered itself
@@ -1583,10 +1619,12 @@ local function dig_answered()
         return
     end
     gave_up_t = nil
+    S.result_t = now
     if auto_wait then
         last_ok_t = auto_wait
         add_latency(now - auto_wait)
         wait_bump = wait_bump * 0.85 -- results are coming: ease the extra wait back off
+        S.pad = math.max(0.05, (S.pad or 0.15) - 0.02) -- going fine: trim the margin
     end
     gave_up_spot = nil
     bad_streak = 0
@@ -1748,10 +1786,30 @@ windower.register_event('incoming text', function(original, modified, mode)
     -- the last dig still playing). Not bad ground: wait a moment, dig here again.
     if S.running and auto_wait and lower:find('wait longer to perform', 1, true) then
         if hyper_test == 'probing' then hyper_failed() return end
-        dbg('MOVE', 'too soon: retrying this spot in 1s')
-        auto_wait = nil
+        -- that dig never happened: go back to waiting on the one before it (if any)
+        local had_prev = S.prev_wait ~= nil
+        auto_wait, S.prev_wait = S.prev_wait, nil
         last_dig_pos, retry_here = prev_dig_pos, true
-        next_dig = math.max(next_dig, os.clock() + 1)
+        if settings.move_during_dig then
+            if had_prev then
+                -- refused while the previous dig was still playing: the game wants
+                -- each dig finished first. After two of these, dig right after
+                -- each result instead of on the cooldown alone.
+                S.busy_hits = (S.busy_hits or 0) + 1
+                if S.busy_hits >= 2 and not S.busy_rule then
+                    S.busy_rule = true
+                    log('The game finishes each dig before taking the next: digging right after each result from now on.')
+                end
+            else
+                -- dug a little before the cooldown was up: add to the learned margin
+                S.pad = math.min(1.5, (S.pad or 0.15) + 0.15)
+            end
+            next_dig = os.clock() + 0.25 -- and try again right away
+            dbg('MOVE', ('too soon: margin %.2fs, wait-for-result %s, retrying this spot'):format(S.pad, tostring(S.busy_rule)))
+        else
+            next_dig = math.max(next_dig, os.clock() + 1)
+            dbg('MOVE', 'too soon: retrying this spot in 1s')
+        end
         return
     end
     if S.running and auto_wait then
@@ -2017,16 +2075,6 @@ local function tick(now)
         return
     end
 
-    -- our /dig is out: wait for the game's answer before moving on
-    if auto_wait then
-        if now - auto_wait < result_wait() then return end
-        bad_ground('no result') -- nothing came back: treat the spot as undiggable
-        return
-    end
-
-    -- let the dig animation finish before turning and moving off
-    if now < settle_until then return end
-
     -- first move after each dig: spin to a new heading that stays in the area
     local function go()
         if need_spin then
@@ -2037,6 +2085,30 @@ local function tick(now)
         end
     end
 
+    -- our /dig is out: its result arrives when the dig animation ends (~4s).
+    -- With movedig on (default) nothing waits for it: BirdUp heads for the next
+    -- spot and digs again the moment the cooldown is up.
+    -- an older dig that never answered either: stop waiting for it
+    -- (it counts as a failed dig, the same as any dig with no answer)
+    if S.prev_wait and now - S.prev_wait >= result_wait() then
+        local newer = auto_wait
+        auto_wait, S.prev_wait = S.prev_wait, nil
+        bad_ground('no result')
+        if not running then return end
+        auto_wait = newer
+    end
+    if auto_wait then
+        if now - auto_wait >= result_wait() then
+            S.prev_wait = nil -- nothing is coming for the older one either
+            bad_ground('no result') -- nothing came back: treat the spot as undiggable
+            return
+        end
+        if not settings.move_during_dig then return end -- movedig off: wait for the result
+    end
+
+    -- movedig off: a short pause after each result before moving on
+    if not settings.move_during_dig and now < settle_until then return end
+
     if now < next_dig then
         if not can_dig_here() then go() end
         return
@@ -2044,6 +2116,9 @@ local function tick(now)
 
     if can_dig_here() then
         if zone_wait_left() > 0 then return end -- area delay after zoning
+        if S.prev_wait then return end -- two digs already waiting on results
+        -- the game finishes each dig first (learned): dig 0.1s after the last result
+        if S.busy_rule and (auto_wait or now < (S.result_t or 0) + 0.1) then return end
         -- only dig once the chocobo has really stopped: the game won't dig
         -- while it's still sliding, and that would look like bad ground
         if moving then stop_moving() end
@@ -2242,9 +2317,10 @@ local SETTINGS = {
             {'area',        'roam_radius',       'num',   'stay within this many yalms of the start (0 = no limit)'},
             {'turnchance',  'turn_chance',       'pct',   '% chance to turn after a dig'},
             {'turn',        'turn_distance',     'num',   'yalms to move after undiggable ground'},
-            {'settle',      'result_buffer',     'num',   'seconds after a dig result before moving'},
+            {'movedig',     'move_during_dig',   'onoff', 'dig on the cooldown, moving during each dig'},
+            {'settle',      'result_buffer',     'num',   'with movedig off: seconds after a result before moving'},
             {'timer',       'extra_wait',        'num',   'extra seconds on top of the dig cooldown'},
-            {'jitter',      'jitter',            'num',   'up to this many random extra seconds per wait'},
+            {'humanize',    'humanize',          'num',   'up to this many random extra seconds per dig (0 = none)'},
             {'tune',        'auto_tune',         'onoff', 'self-tuning no-result wait'},
         }},
         {'Stopping', {
@@ -2269,6 +2345,7 @@ function SETTINGS.index() -- (in a function: loop variables don't count toward t
     for _, g in ipairs(SETTINGS.groups) do
         for _, d in ipairs(g[2]) do SETTINGS.by_name[d[1]] = d end
     end
+    SETTINGS.by_name.jitter = SETTINGS.by_name.humanize -- older name
 end
 SETTINGS.index()
 
@@ -2598,6 +2675,8 @@ COMMANDS[#COMMANDS + 1] = {function(cmd, a) return cmd == 'tune' end, function(c
         log(('Auto-tune %s. Results measured: %d (avg %.1fs). No-result wait now %.1fs%s.'):format(
             settings.auto_tune and 'on' or 'off', #latency, avg, result_wait(),
             (settings.auto_tune and #latency < 5) and ' (needs 5 digs to start tuning)' or ''))
+        log(('Dig timing: every %ds cooldown + %.2fs margin (learned from "wait longer")%s.'):format(
+            dig_delay(), S.pad or 0.15, settings.humanize > 0 and (' + up to %.1fs random'):format(settings.humanize) or ''))
 end}
 -- //bup import [file | list | clear]
 COMMANDS[#COMMANDS + 1] = {function(cmd, a) return cmd == 'import' end, function(cmd, a)
