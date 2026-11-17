@@ -1,6 +1,6 @@
 _addon.name     = 'birdup'
 _addon.author   = 'Valdimar @ Phoenix' -- auto-dig based on Velner/chocodig
-_addon.version  = '4.0'
+_addon.version  = '4.1'
 _addon.commands = {'birdup', 'bup'}
 
 -- Says in chat when a newer version is on GitHub (once per load; see update_check.lua)
@@ -84,6 +84,7 @@ local defaults = {
     collapse_items    = false, -- hide the ITEMS FOUND list (click its header)
     locked            = false, -- panel can't be dragged
     zone_window       = false,
+    rewards_window    = false, -- digging rewards window (REWARDS button / //bup rewards)
     hyper_start       = 0,     -- Hyper Campaign dates (JST, yyyymmdd); 0 = none set
     hyper_end         = 0, -- zone stats window beside the main panel (ZONES button / //bup zonewin)  -- only show the HUD while on a chocobo (or auto-digging)
     line_spacing      = 18,    -- pixels from one HUD line to the next
@@ -278,6 +279,7 @@ local clean_name      -- defined in the prices section below
 local save_history    -- defined just below
 local Z               -- zone stats + sharing module (birdup_zones.lua)
 local ROE             -- Records of Eminence module (birdup_roe.lua)
+local REW             -- digging rewards by zone + REWARDS window (birdup_rewards.lua)
 
 ---------------------------------------------------------------------------
 -- Daily history: one entry per Japan day (fatigue resets at midnight JST).
@@ -764,6 +766,11 @@ local hud = {
 }
 hud.l_zones:text('ZONES')
 K.ZBTN_W, K.ZBTN_H = 56, 18
+-- REWARDS header button, just left of ZONES
+hud.b_rew = solid(70, 18, 255, 60, 75, 110)
+hud.l_rew = mk_text(9)
+hud.l_rew:text('REWARDS')
+K.RBTN_W = 70
 
 -- Zone stats window, docked to the right of the main panel
 K.ZW_MIN, K.ZW_GAP = 230, 6
@@ -775,6 +782,23 @@ local zwin = {
 }
 -- zone window lines, their offsets, how many are in use, its width, shown?
 local zw_pool, zw_ry, zw_used, zw_w, zw_on = {}, {}, 0, K.ZW_MIN, false
+
+-- Digging rewards by zone (birdup_rewards.lua): needs the panel's drawing
+-- helpers and colors, and what you've dug in a zone (all Wing ranks together)
+REW = require('birdup_rewards')({
+    solid = solid,
+    mk_text = mk_text,
+    C = C,
+    log = function(m) log(m) end,
+    found = function(zone_name)
+        local zid = Z.zone_id_for((zone_name or ''):gsub('%(S%)', '[S]'))
+        local got = {}
+        for _, e in pairs((zid and Z.stats()[zid]) or {}) do
+            for item, n in pairs(e.items) do got[item] = (got[item] or 0) + n end
+        end
+        return got
+    end,
+})
 
 -- Buttons, relative to the panel's top-left corner
 K.BTN_Y, K.BTN_H = 50, 22
@@ -811,6 +835,7 @@ end
 
 local layout -- defined below
 local draw_zone_window -- defined below
+local draw_rewards_window -- defined below
 -- the header text, kept for measuring the panel width
 local title_str = ''
 -- low greens / low bag space already announced in chat?
@@ -847,6 +872,10 @@ layout = function()
     end
     hud.b_zones:pos(px + W - K.ZBTN_W - 6, py + 4)
     hud.l_zones:pos(px + W - K.ZBTN_W - 6 + 9, py + 5)
+    hud.b_rew:pos(px + W - K.ZBTN_W - K.RBTN_W - 12, py + 4)
+    hud.l_rew:pos(px + W - K.ZBTN_W - K.RBTN_W - 12 + 7, py + 5)
+    -- rewards window: right of the zone window when that's open, else right of the panel
+    REW.move(px + W + K.ZW_GAP + (zw_on and (zw_w + K.ZW_GAP) or 0), py)
     -- zone window sits just right of the main panel
     local zx = px + W + K.ZW_GAP
     zwin.bg:pos(zx, py)
@@ -868,6 +897,7 @@ local function hud_show(on)
     if not on then
         for _, t in ipairs(lines_pool) do t:hide() end
         zwin_show(false)
+        REW.hide()
     end
 end
 
@@ -978,6 +1008,14 @@ draw_zone_window = function(sp)
 end
 
 -- the State row: IDLE / DIGGING / MOVING / PAUSED, colored
+-- the REWARDS window: right of the zone window when that's open, else right
+-- of the panel (kept out of update_hud to keep that function's variable count down)
+draw_rewards_window = function(sp)
+    if settings.rewards_window then hud.b_rew:color(80, 120, 170) else hud.b_rew:color(60, 75, 110) end
+    if not settings.rewards_window then REW.hide() return end
+    REW.draw(px + W + K.ZW_GAP + (zw_on and (zw_w + K.ZW_GAP) or 0), py, sp, Z.zone_name(Z.current_zone()))
+end
+
 local function state_text()
     if not S.running then return C.dim .. 'IDLE' .. C.r end
     if S.paused then return C.warn .. 'PAUSED' .. C.r end
@@ -1181,7 +1219,7 @@ local function update_hud(now)
     draw_lines(out)
 
     -- size the box to the longest line (Consolas 10 is ~7.5 px a character, 11 is ~8.3)
-    local widest = text_width(hud.title, title_str, 8.3) + K.ZBTN_W + 12 -- room for the ZONES button
+    local widest = text_width(hud.title, title_str, 8.3) + K.ZBTN_W + K.RBTN_W + 18 -- room for ZONES + REWARDS
     for i, l in ipairs(out) do
         widest = math.max(widest, text_width(lines_pool[i], l[1], 7.5))
     end
@@ -1193,6 +1231,7 @@ local function update_hud(now)
     -- ZONES button looks pressed while the window is open
     if settings.zone_window then hud.b_zones:color(80, 120, 170) else hud.b_zones:color(60, 75, 110) end
     draw_zone_window(sp)
+    draw_rewards_window(sp) -- after the zone window, whose width decides where it goes
 end
 
 ---------------------------------------------------------------------------
@@ -2037,6 +2076,7 @@ end)
 -- Zoning stops auto-dig and starts the area-delay timer.
 windower.register_event('zone change', function()
     zoned_at = os.clock()
+    REW.view = nil -- the rewards window follows you to the new zone
     dbg('ZONE', Z.zone_name(Z.current_zone()))
     if S.running then stop_addon('zone change.') end
 end)
@@ -2076,6 +2116,7 @@ end
 -- which panel button is under the mouse ('start', 'stop', 'zones'), if any
 local function button_at(mx, my)
     if inside(mx, my, px + W - K.ZBTN_W - 6, py + 4, K.ZBTN_W, K.ZBTN_H) then return 'zones' end
+    if inside(mx, my, px + W - K.ZBTN_W - K.RBTN_W - 12, py + 4, K.RBTN_W, K.ZBTN_H) then return 'rewards' end
     for key, b in pairs(buttons) do
         if inside(mx, my, px + b.rx, py + K.BTN_Y, BTN_W, K.BTN_H) then return key end
     end
@@ -2090,6 +2131,12 @@ windower.register_event('mouse', function(type, mx, my, delta, blocked)
             return true
         end
     elseif type == 1 then
+        -- the rewards window: its < > buttons, and swallow other clicks on it
+        local rh = (not blocked) and REW.hit(mx, my)
+        if rh then
+            pressed = (rh ~= 'window') and ('rew_' .. rh) or nil
+            return true
+        end
         if blocked or not inside(mx, my, px, py, W, panel_h) then return end
         pressed = button_at(mx, my)
         if not pressed and inside(mx, my, px, py + items_hdr_y - 2, W, items_hdr_h) then pressed = 'items' end
@@ -2099,6 +2146,15 @@ windower.register_event('mouse', function(type, mx, my, delta, blocked)
         end
         return true
     elseif type == 2 then
+        if pressed == 'rew_prev' or pressed == 'rew_next' then
+            local key = pressed
+            pressed = nil
+            if REW.hit(mx, my) == key:sub(5) then
+                REW.step(key == 'rew_prev' and -1 or 1, Z.zone_name(Z.current_zone()))
+                hud_last = 0
+            end
+            return true
+        end
         if drag then
             drag = nil
             settings.pos.x, settings.pos.y = px, py
@@ -2116,6 +2172,9 @@ windower.register_event('mouse', function(type, mx, my, delta, blocked)
                     config.save(settings)
                 elseif key == 'zones' then
                     settings.zone_window = not settings.zone_window
+                    config.save(settings)
+                elseif key == 'rewards' then
+                    settings.rewards_window = not settings.rewards_window
                     config.save(settings)
                 elseif key == 'start' then start_addon() else
                     if S.running then stop_addon(nil) else log('Auto-dig is not running.') end
@@ -2297,7 +2356,7 @@ SETTINGS.help_text = {
         '  status  finds  history  zone  prices  currency  wing    information',
         '  hyper  anchor  fatigue                                  while digging',
         '  export  import  debug                                   sharing and troubleshooting',
-        '  hud  compact  items  lock  zones  view                  the panel',
+        '  hud  compact  items  lock  zones  rewards  view         the panel',
         '  set [name value]          see or change any setting',
         '  reload  reset  saveall                                  housekeeping',
     },
@@ -2333,6 +2392,9 @@ SETTINGS.help_text = {
         'items [on|off]          collapse the item list (or click ITEMS FOUND)',
         'lock [on|off]           stop the panel being dragged',
         'zones [on|off]          the zone stats window (or click ZONES)',
+        'rewards [on|off]        what each zone can give, by rarity (or click REWARDS)',
+        'rewards <zone> / here   show another zone / back to the zone you\'re in',
+        'rewards list            every zone with digging data',
         'view today | lifetime   which totals the item list shows',
         'Without on/off, each of these switches between the two.',
     },
@@ -2370,6 +2432,32 @@ COMMANDS[#COMMANDS + 1] = {function(cmd, a) return cmd == 'warn' end, function(c
     end
 end}
 -- //bup hud | compact | items | lock | zones [on|off]
+-- //bup rewards [on|off | here | list | <zone>]: digging rewards by zone
+COMMANDS[#COMMANDS + 1] = {function(cmd, a) return cmd == 'rewards' or cmd == 'reward' end, function(cmd, a)
+    local arg = table.concat(a, ' ')
+    local low = arg:lower()
+    if low == 'list' then
+        local names = {}
+        for _, z in ipairs(REW.zones) do names[#names + 1] = z.name end
+        log(('Digging rewards for %d zones: %s'):format(#names, table.concat(names, ', ')))
+        return
+    end
+    if low == 'here' then
+        REW.view = nil
+        settings.rewards_window = true
+    elseif low == '' or low == 'on' or low == 'off' or low == 'toggle' then
+        settings.rewards_window = SETTINGS.bool(low, settings.rewards_window)
+    else
+        local z = REW.find(arg)
+        if not z then log(('No digging data for "%s". //bup rewards list shows every zone.'):format(arg)) return end
+        REW.view = z
+        settings.rewards_window = true
+    end
+    config.save(settings)
+    hud_last = 0
+    log('Rewards window: ' .. (settings.rewards_window and 'on' or 'off') ..
+        (settings.rewards_window and REW.view and (' (' .. REW.view.name .. ')') or ''))
+end}
 COMMANDS[#COMMANDS + 1] = {function(cmd, a) return SETTINGS.panel[cmd] ~= nil end, function(cmd, a)
     local t = SETTINGS.panel[cmd]
     local v = SETTINGS.bool(a[1], settings[t[1]])

@@ -2,7 +2,7 @@
 
 A Windower 4 addon for Final Fantasy XI that automates chocobo digging and tracks everything about it: fatigue, free digs, inventory space, and every item you find. It combines the auto-dig behavior of [Velner/chocodig](https://github.com/Velner/chocodig) with dig tracking, all shown on one draggable HUD.
 
-**Author:** Valdimar @ Phoenix  **Version:** 4.0  **Commands:** `//birdup` or `//bup`
+**Author:** Valdimar @ Phoenix  **Version:** 4.1  **Commands:** `//birdup` or `//bup`
 
 ---
 
@@ -15,6 +15,7 @@ A Windower 4 addon for Final Fantasy XI that automates chocobo digging and track
 - **Daily history:** one log per Japan day, with every session that day added together.
 - **Zone delay:** waits out your Wing rank's area delay after zoning before the first dig (5 seconds during a Hyper Campaign).
 - **Early warnings:** the panel header flashes when you're low on greens or bag space, before auto-dig has to stop.
+- **Digging rewards by zone:** a REWARDS window lists everything each zone can give, grouped by rarity (from BG-Wiki), and marks what you've already dug there.
 - **Zone stats + sharing:** finds and drop rates per zone and Wing rank, in an optional window beside the panel, exportable as a report and CSV you can share, and importable from other players.
 - **Self-tuning waits:** measures how fast dig results really arrive and sets the "no result" wait to match.
 - **Compact mode and lock:** show only the key rows, collapse the item list, and lock the panel in place.
@@ -41,8 +42,10 @@ A Windower 4 addon for Final Fantasy XI that automates chocobo digging and track
    Windower/addons/birdup/birdup.lua
    Windower/addons/birdup/birdup_zones.lua
    Windower/addons/birdup/birdup_roe.lua
+   Windower/addons/birdup/birdup_rewards.lua
+   Windower/addons/birdup/update_check.lua
    ```
-   All three files are needed (from 3.5 on, BirdUp is split into several files).
+   All five files are needed (BirdUp is split into several files).
 2. In game, load it:
    ```
    //lua load birdup
@@ -86,6 +89,7 @@ The HUD appears automatically when you get on a chocobo and hides when you get o
 |------|---------------|
 | Title and top bar | Today's fatigue digs against your cap. The bar is green, turns amber at 70% and red at 90%. |
 | ZONES | Header button that shows or hides the zone stats window. It's lit while the window is open. |
+| REWARDS | Header button that shows or hides the digging rewards window (see below). |
 | START / STOP | Buttons that start and stop auto-digging. The one that does something right now is bright. |
 | Warning | Appears at the top when greens or free bag slots are low (`warngreens` / `warnslots`, default 10 greens / 5 slots). The header strip flashes amber while it's showing, and chat gets one line when it first appears. |
 | State | IDLE, DIGGING, MOVING or PAUSED. While auto-digging, also how far you are from the center of the digging area. |
@@ -164,6 +168,10 @@ Each of these takes `on` or `off`; without one, it switches between the two.
 | `items` | Collapse the item list (same as clicking ITEMS FOUND). |
 | `lock` | Stop the panel being dragged. |
 | `zones` | The zone stats window (same as the ZONES button). Also `zone window on\|off`. |
+| `rewards` | The digging rewards window (same as the REWARDS button). |
+| `rewards <zone>` | Show another zone's rewards, by full or partial name (`rewards gusta`, `rewards grauberg (S)`). |
+| `rewards here` | Back to the zone you're in. |
+| `rewards list` | Every zone with digging data. |
 | `view today \| lifetime` | Which totals the item list shows. |
 
 ### Settings: `//bup set`
@@ -286,6 +294,28 @@ The dates are saved in your settings, so they last through reloads, logouts and 
 **How long each setting lasts:** saved dates last until you clear them. `hyper on` / `hyper off` last until you reload BirdUp (or use `hyper auto`), whatever the date. Without either, BirdUp tests on every start. If you don't know your Wing Skill, auto-dig assumes the slowest cooldown (15 seconds) until you set it with `//bup wing <level>`.
 
 ---
+
+## Digging rewards by zone
+
+Click **REWARDS** on the panel header (or `//bup rewards`) to open a window listing everything the zone can give when digging, grouped by rarity:
+
+| Rarity | Shown as |
+|--------|----------|
+| VC | Very common |
+| C | Common |
+| U | Uncommon |
+| R | Rare (blue) |
+| VR | Very rare (purple) |
+| SR | Super rare (gold) |
+
+- Items you've already dug in that zone (at any Wing rank) are marked with `*`, with a count at the bottom: `* = you've dug it here: 9 of 16`.
+- Conditions are shown next to the item, for example `Ice Cluster (double weather)`.
+- It follows you: it shows the zone you're in and switches when you zone.
+- Use **<** and **>** in the window's header to browse every zone, or `//bup rewards <zone>` to jump to one (partial names work). The `<` button lights up while you're browsing another zone; `//bup rewards here` or zoning goes back.
+- Behemoth's Dominion shows its separate Burrow and Bore tables underneath the main list.
+- The window sits to the right of the panel, or to the right of the zone stats window when that's open.
+
+The data covers 59 zones and comes from BG-Wiki's [Chocobo Digging](https://www.bg-wiki.com/ffxi/Category:Chocobo_Digging) page ("Digging Rewards by Zone", November 2026). Elemental ores, colored rocks and clusters depend on weather (and moon phase for elemental ores), which the wiki notes but doesn't list zone by zone. To update a zone, edit its line near the top of `birdup_rewards.lua`.
 
 ## Zone stats and sharing
 
@@ -526,6 +556,8 @@ Automating movement and actions may go against the game's terms of service or yo
 | `birdup.lua` | The panel, auto-dig, dig tracking, prices, history and commands. |
 | `birdup_zones.lua` | Per-zone drop stats, and the import/export sharing. |
 | `birdup_roe.lua` | Records of Eminence progress. |
+| `birdup_rewards.lua` | Digging rewards by zone (BG-Wiki data) and the REWARDS window. |
+| `update_check.lua` | Reports in chat on load whether a newer version is on GitHub. |
 
 Windower runs LuaJIT, which limits how many variables one file and one function can use. Splitting BirdUp up keeps it well inside those limits, so new features can keep being added safely.
 

@@ -248,5 +248,6 @@ return {
     load_community = load_community,
     import_file = import_file,
     combined = combined_entry,
+    zone_id_for = zone_id_for,
 }
 end
