@@ -1,6 +1,6 @@
 _addon.name     = 'birdup'
 _addon.author   = 'Valdimar @ Phoenix' -- auto-dig based on Velner/chocodig
-_addon.version  = '4.2'
+_addon.version  = '4.3'
 _addon.commands = {'birdup', 'bup'}
 
 -- Says in chat when a newer version is on GitHub (once per load; see update_check.lua)
@@ -1791,21 +1791,12 @@ windower.register_event('incoming text', function(original, modified, mode)
         auto_wait, S.prev_wait = S.prev_wait, nil
         last_dig_pos, retry_here = prev_dig_pos, true
         if settings.move_during_dig then
-            if had_prev then
-                -- refused while the previous dig was still playing: the game wants
-                -- each dig finished first. After two of these, dig right after
-                -- each result instead of on the cooldown alone.
-                S.busy_hits = (S.busy_hits or 0) + 1
-                if S.busy_hits >= 2 and not S.busy_rule then
-                    S.busy_rule = true
-                    log('The game finishes each dig before taking the next: digging right after each result from now on.')
-                end
-            else
+            if not had_prev then
                 -- dug a little before the cooldown was up: add to the learned margin
                 S.pad = math.min(1.5, (S.pad or 0.15) + 0.15)
             end
             next_dig = os.clock() + 0.25 -- and try again right away
-            dbg('MOVE', ('too soon: margin %.2fs, wait-for-result %s, retrying this spot'):format(S.pad, tostring(S.busy_rule)))
+            dbg('MOVE', ('too soon: margin %.2fs, retrying this spot'):format(S.pad))
         else
             next_dig = math.max(next_dig, os.clock() + 1)
             dbg('MOVE', 'too soon: retrying this spot in 1s')
@@ -2117,8 +2108,10 @@ local function tick(now)
     if can_dig_here() then
         if zone_wait_left() > 0 then return end -- area delay after zoning
         if S.prev_wait then return end -- two digs already waiting on results
-        -- the game finishes each dig first (learned): dig 0.1s after the last result
-        if S.busy_rule and (auto_wait or now < (S.result_t or 0) + 0.1) then return end
+        -- one dig at a time: the game silently ignores a /dig sent while the
+        -- last dig is still playing (no "wait longer", just nothing), so the
+        -- next dig goes right after the last result (the move happens during it)
+        if auto_wait or now < (S.result_t or 0) + 0.05 then return end
         -- only dig once the chocobo has really stopped: the game won't dig
         -- while it's still sliding, and that would look like bad ground
         if moving then stop_moving() end
