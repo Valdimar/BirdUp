@@ -1,6 +1,6 @@
 _addon.name     = 'birdup'
 _addon.author   = 'Valdimar @ Phoenix' -- auto-dig based on Velner/chocodig
-_addon.version  = '4.4'
+_addon.version  = '4.5'
 _addon.commands = {'birdup', 'bup'}
 
 -- Says in chat when a newer version is on GitHub (once per load; see update_check.lua)
@@ -1526,6 +1526,9 @@ end
 local function attempt_dig()
     stop_moving()
     prev_dig_pos, last_dig_pos = last_dig_pos, get_pos()
+    if last_dig_pos then
+        dbg('DIG', prev_dig_pos and ('%.1f yalms from the last dig'):format(dist2d(last_dig_pos, prev_dig_pos)) or 'first dig')
+    end
     retry_here = false
     need_spin = true
     -- movedig: the previous dig's result may still be coming (results take ~4s,
@@ -2041,7 +2044,10 @@ local function tick(now)
             -- remember the wall: where it is and which way it faces us
             local me = get_me()
             if pos and me and me.facing then S.wall = {pos = pos, facing = me.facing} end
-            dbg('MOVE', ('blocked (%s), count %d'):format(why, blocked_count))
+            dbg('MOVE', ('blocked (%s), count %d, %.1f yalms from the last dig, %.1f moved in the last %.0fs (top speed %.1f/s)%s'):format(
+                why, blocked_count, (pos and last_dig_pos) and dist2d(pos, last_dig_pos) or 0,
+                (pos and prog_pos) and dist2d(pos, prog_pos) or 0, settings.stuck_check_time, S.run_speed or 0,
+                auto_wait and ', dig playing' or ''))
             -- dig where it stopped, unless that's too close to the last dig
             local far = not (pos and last_dig_pos) or dist2d(pos, last_dig_pos) >= (settings.min_distance or 2)
             if blocked_count == 1 and far then
@@ -2052,9 +2058,11 @@ local function tick(now)
             end
         end
         -- blocked = less than 40% of your normal running speed (measured as you
-        -- go), so grinding along a wall at a shallow angle counts too
-        local min_prog = math.max(settings.stuck_epsilon, settings.blocked_progress * settings.stuck_check_time,
-            0.4 * (S.run_speed or 0) * settings.stuck_check_time)
+        -- go), so grinding along a wall at a shallow angle counts too.
+        -- While a dig is still playing the chocobo moves slower, so then only
+        -- a real stop (under blocked_progress, 1 yalm a second) counts.
+        local rel = auto_wait and 0 or 0.4 * (S.run_speed or 0) * settings.stuck_check_time
+        local min_prog = math.max(settings.stuck_epsilon, settings.blocked_progress * settings.stuck_check_time, rel)
         if pos and move_start_pos and dist2d(pos, move_start_pos) >= move_target then
             stop_moving()
             blocked_count = 0
@@ -2065,7 +2073,7 @@ local function tick(now)
             else
                 -- learn normal running speed (top speed seen, slowly forgotten)
                 local spd = moved / (now - prog_time)
-                S.run_speed = math.max(spd, (S.run_speed or 0) * 0.98)
+                if not auto_wait then S.run_speed = math.max(spd, (S.run_speed or 0) * 0.98) end
                 prog_time, prog_pos = now, pos
             end
         elseif now - move_start_time >= settings.move_timeout then
