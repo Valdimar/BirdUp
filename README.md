@@ -2,14 +2,14 @@
 
 A Windower 4 addon for Final Fantasy XI that automates chocobo digging and tracks everything about it: fatigue, free digs, inventory space, and every item you find. It combines the auto-dig behavior of [Velner/chocodig](https://github.com/Velner/chocodig) with dig tracking, all shown on one draggable HUD.
 
-**Author:** Valdimar @ Phoenix  **Version:** 4.3  **Commands:** `//birdup` or `//bup`
+**Author:** Valdimar @ Phoenix  **Version:** 4.4  **Commands:** `//birdup` or `//bup`
 
 ---
 
 ## Features
 
 - **City prices:** vendor prices are kept per city (fame changes what vendors pay), and you're told when you sell somewhere that pays less.
-- **Auto-dig:** digs as fast as the game allows. It sends `/dig`, moves to the next spot while the dig animation plays, and digs again the instant the result comes in (or when the cooldown is up, if that's later). One move per dig, and no hesitation between digs. It waits until the chocobo has fully stopped before each dig, so a dig is never wasted while it's still sliding. It turns when stuck. If it runs into a wall before it's gone far enough, it digs right there and then turns away. After each dig finishes it either carries on the same way or turns to a random new heading (50/50 by default), while staying within an area around where you started. On ground that can't be dug, it turns roughly around, moves a few yalms and tries again.
+- **Auto-dig:** digs as fast as the game allows. It sends `/dig`, moves to the next spot while the dig animation plays, and digs again the instant the result comes in (or when the cooldown is up, if that's later). One move per dig, and no hesitation between digs. It waits until the chocobo has fully stopped before each dig, so a dig is never wasted while it's still sliding. It turns when stuck. Digs are 5 yalms apart, and never closer than 2 (`mindist`). If it runs into a wall before it's gone far enough, it digs right there and then turns away, as long as that's at least 2 yalms from the last dig. Otherwise it just turns away. After each dig finishes it either carries on the same way or turns to a random new heading (50/50 by default), while staying within an area around where you started. On ground that can't be dug, it turns roughly around, moves a few yalms and tries again.
 - **Wing Skill:** reads your Wing Skill from chat and sets the dig cooldown to match (never digs faster than the game allows).
 - **Start / Stop buttons:** click them right on the panel.
 - **Daily history:** one log per Japan day, with every session that day added together.
@@ -182,6 +182,7 @@ Each of these takes `on` or `off`; without one, it switches between the two.
 |------|---------|--------------|
 | **Auto-dig** | | |
 | `distance` | 5 | Yalms to travel between digs. |
+| `mindist` | 2 | Never dig closer than this to the last dig, even after hitting a wall or a refused dig. |
 | `area` | 20 | Stay within this many yalms of where auto-dig started (0 = no limit). |
 | `turnchance` | 50 | % chance to turn after a dig instead of carrying on. |
 | `turn` | 3 | Yalms to move after undiggable ground. |
@@ -491,6 +492,7 @@ These are in `settings.xml` and can be changed with the commands above.
 | `humanize` | 0 | Up to this many random extra seconds per dig. |
 | `jitter` | 0.6 | No longer used (see `humanize`). |
 | `required_distance` | 5 | Yalms (2D) to travel between digs. |
+| `min_distance` | 2 | Never dig closer than this to the last dig (`mindist`). |
 | `move_timeout` | 8 | Seconds before a movement attempt is abandoned and it turns. |
 | `result_buffer` | 0.3 | With `move_during_dig` off: seconds after a dig result before turning and moving. |
 | `dig_settle` | 2.5 | No longer used (the dig result means the dig has finished). |

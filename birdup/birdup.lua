@@ -1,6 +1,6 @@
 _addon.name     = 'birdup'
 _addon.author   = 'Valdimar @ Phoenix' -- auto-dig based on Velner/chocodig
-_addon.version  = '4.3'
+_addon.version  = '4.4'
 _addon.commands = {'birdup', 'bup'}
 
 -- Says in chat when a newer version is on GitHub (once per load; see update_check.lua)
@@ -61,6 +61,7 @@ local defaults = {
     jitter            = 0.6,   -- (no longer used: see humanize)
     humanize          = 0,     -- up to this many random extra seconds per dig (0 = dig right on the cooldown)
     required_distance = 5,     -- yalms (2D) to travel between digs
+    min_distance      = 2,     -- never dig closer than this to the last dig, even at a wall (//bup set mindist)
     move_timeout      = 8,
     turn_distance     = 3,     -- yalms to move after turning away from undiggable ground
     dig_settle        = 2.5,   -- (no longer used: the dig result means the dig has finished)
@@ -1345,9 +1346,14 @@ local bad_ground_log = 0
 
 -- far enough from the last dig (or allowed to dig here after bad ground / a wall)?
 local function can_dig_here()
-    if retry_here or not last_dig_pos then return true end
+    if not last_dig_pos then return true end
     local pos = get_pos()
-    return pos and dist2d(pos, last_dig_pos) >= settings.required_distance
+    if not pos then return false end
+    local d = dist2d(pos, last_dig_pos)
+    -- a retry (wall, refused dig) may dig short of the full distance, but
+    -- never closer than min_distance to the last dig
+    if retry_here then return d >= (settings.min_distance or 2) end
+    return d >= settings.required_distance
 end
 
 -- stop auto-digging and say why
@@ -2036,7 +2042,9 @@ local function tick(now)
             local me = get_me()
             if pos and me and me.facing then S.wall = {pos = pos, facing = me.facing} end
             dbg('MOVE', ('blocked (%s), count %d'):format(why, blocked_count))
-            if blocked_count == 1 then
+            -- dig where it stopped, unless that's too close to the last dig
+            local far = not (pos and last_dig_pos) or dist2d(pos, last_dig_pos) >= (settings.min_distance or 2)
+            if blocked_count == 1 and far then
                 retry_here, wall_hit = true, true -- dig where it stopped
             else
                 wall_hit = false
@@ -2307,6 +2315,7 @@ local SETTINGS = {
     groups = {
         {'Auto-dig', {
             {'distance',    'required_distance', 'num',   'yalms to travel between digs'},
+            {'mindist',     'min_distance',      'num',   'never dig closer than this to the last dig (walls, retries)'},
             {'area',        'roam_radius',       'num',   'stay within this many yalms of the start (0 = no limit)'},
             {'turnchance',  'turn_chance',       'pct',   '% chance to turn after a dig'},
             {'turn',        'turn_distance',     'num',   'yalms to move after undiggable ground'},
