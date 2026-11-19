@@ -1,6 +1,6 @@
 _addon.name     = 'birdup'
 _addon.author   = 'Valdimar @ Phoenix' -- auto-dig based on Velner/chocodig
-_addon.version  = '4.6'
+_addon.version  = '4.7'
 _addon.commands = {'birdup', 'bup'}
 
 -- Says in chat when a newer version is on GitHub (once per load; see update_check.lua)
@@ -68,7 +68,7 @@ local defaults = {
     result_buffer     = 0.3,   -- seconds after a dig result before turning and moving (//bup settle)
     turn_chance       = 50,    -- % chance to turn after a dig (otherwise keep going the same way)
     roam_radius       = 20,    -- stay within this many yalms of where auto-dig started (0 = no limit)
-    move_during_dig   = true,  -- dig on the cooldown and move during the dig animation (//bup set movedig)
+    move_during_dig   = false, -- no longer used: the dig animation freezes the chocobo, so it can't move during a dig
     stop_settle       = 0.4,   -- seconds the chocobo must be standing still before a dig
     result_timeout    = 5,     -- used until auto_tune has enough measurements
     auto_tune         = true,  -- set the no-result wait from how fast results really arrive
@@ -1539,7 +1539,7 @@ local function attempt_dig()
     -- the next dig: right on the cooldown (Wing Skill or campaign) plus a small
     -- margin that BirdUp learns from "You must wait longer" (S.pad)
     S.pad = S.pad or 0.15
-    local margin = settings.move_during_dig and S.pad or 0.3
+    local margin = 0.3
     next_dig = os.clock() + dig_delay() + margin + settings.extra_wait + math.random() * settings.humanize
     windower.send_command('input /dig')
 end
@@ -1799,7 +1799,7 @@ windower.register_event('incoming text', function(original, modified, mode)
         local had_prev = S.prev_wait ~= nil
         auto_wait, S.prev_wait = S.prev_wait, nil
         last_dig_pos, retry_here = prev_dig_pos, true
-        if settings.move_during_dig then
+        if false then -- (moving during a dig is gone: see move_during_dig)
             if not had_prev then
                 -- dug a little before the cooldown was up: add to the learned margin
                 S.pad = math.min(1.5, (S.pad or 0.15) + 0.15)
@@ -2123,11 +2123,14 @@ local function tick(now)
             bad_ground('no result') -- nothing came back: treat the spot as undiggable
             return
         end
-        if not settings.move_during_dig then return end -- movedig off: wait for the result
+        -- the dig animation freezes the chocobo where it stands, and the dig
+        -- lands there: moving off during a dig just puts the dig (and the
+        -- next one) in the same spot. So stand still until the result is in.
+        return
     end
 
     -- movedig off: a short pause after each result before moving on
-    if not settings.move_during_dig and now < settle_until then return end
+    if now < settle_until then return end
 
     if now < next_dig then
         if not can_dig_here() then go() end
@@ -2340,7 +2343,6 @@ local SETTINGS = {
             {'area',        'roam_radius',       'num',   'stay within this many yalms of the start (0 = no limit)'},
             {'turnchance',  'turn_chance',       'pct',   '% chance to turn after a dig'},
             {'turn',        'turn_distance',     'num',   'yalms to move after undiggable ground'},
-            {'movedig',     'move_during_dig',   'onoff', 'dig on the cooldown, moving during each dig'},
             {'settle',      'result_buffer',     'num',   'with movedig off: seconds after a result before moving'},
             {'timer',       'extra_wait',        'num',   'extra seconds on top of the dig cooldown'},
             {'humanize',    'humanize',          'num',   'up to this many random extra seconds per dig (0 = none)'},

@@ -2,14 +2,14 @@
 
 A Windower 4 addon for Final Fantasy XI that automates chocobo digging and tracks everything about it: fatigue, free digs, inventory space, and every item you find. It combines the auto-dig behavior of [Velner/chocodig](https://github.com/Velner/chocodig) with dig tracking, all shown on one draggable HUD.
 
-**Author:** Valdimar @ Phoenix  **Version:** 4.6  **Commands:** `//birdup` or `//bup`
+**Author:** Valdimar @ Phoenix  **Version:** 4.7  **Commands:** `//birdup` or `//bup`
 
 ---
 
 ## Features
 
 - **City prices:** vendor prices are kept per city (fame changes what vendors pay), and you're told when you sell somewhere that pays less.
-- **Auto-dig:** digs as fast as the game allows. It sends `/dig`, moves to the next spot while the dig animation plays, and digs again the instant the result comes in (or when the cooldown is up, if that's later). One move per dig, and no hesitation between digs. It waits until the chocobo has fully stopped before each dig, so a dig is never wasted while it's still sliding. It turns when stuck. Digs are 5 yalms apart, and never closer than 2 (`mindist`). If it runs into a wall before it's gone far enough, it digs right there and then turns away, as long as that's at least 2 yalms from the last dig. Otherwise it just turns away. After each dig finishes it either carries on the same way or turns to a random new heading (50/50 by default), while staying within an area around where you started. On ground that can't be dug, it turns roughly around, moves a few yalms and tries again.
+- **Auto-dig:** dig > wait for the result > move > dig. The dig animation freezes the chocobo in place and the dig lands where it stands, so it stays put until the result comes in, then moves to the next spot and digs again as soon as it has stopped. It waits until the chocobo has fully stopped before each dig, so a dig is never wasted while it's still sliding. It turns when stuck. Digs are 5 yalms apart (`distance`), and never closer than 2 (`mindist`). If it runs into a wall before it's gone far enough, it digs right there and then turns away, as long as that's at least 2 yalms from the last dig. Otherwise it just turns away. After each dig finishes it either carries on the same way or turns to a random new heading (50/50 by default), while staying within an area around where you started. On ground that can't be dug, it turns roughly around, moves a few yalms and tries again.
 - **Wing Skill:** reads your Wing Skill from chat and sets the dig cooldown to match (never digs faster than the game allows).
 - **Start / Stop buttons:** click them right on the panel.
 - **Daily history:** one log per Japan day, with every session that day added together.
@@ -186,8 +186,7 @@ Each of these takes `on` or `off`; without one, it switches between the two.
 | `area` | 20 | Stay within this many yalms of where auto-dig started (0 = no limit). |
 | `turnchance` | 50 | % chance to turn after a dig instead of carrying on. |
 | `turn` | 3 | Yalms to move after undiggable ground. |
-| `movedig` | on | Move during each dig's animation and dig again as soon as the result is in. Off = the older, slower style: wait for each result, then move. |
-| `settle` | 0.3 | With `movedig` off: seconds after a dig result before turning and moving. |
+| `settle` | 0.3 | Seconds after a dig result before turning and moving. |
 | `timer` | 0 | Extra seconds on top of the dig cooldown. |
 | `humanize` | 0 | Up to this many random extra seconds per dig (0 = dig right on the cooldown). `jitter` still works as another name for it. |
 | `tune` | on | Self-tuning no-result wait. |
@@ -246,7 +245,7 @@ Since the March 2026 update, chocobo digging skill is called **Wing Skill**, and
 
 - BirdUp reads your Wing Skill from skill-up lines in chat and remembers it per character.
 - The game also won't take a new dig until the last dig's animation has finished, which is when its result shows up (3 to 5.5 seconds after the dig). A `/dig` sent before that is silently ignored: no message, no dig. So at Wing Skill 30+ the animation, not the 3-second cooldown, is what sets the pace.
-- Auto-dig digs once the result is in and the cooldown is up, whichever comes later, and moves to the next spot during the dig. On top of the cooldown it adds a small margin for lag that it learns as it goes: it starts at 0.15s, shrinks a little after every dig that goes through, and grows a little if the game ever says *"You must wait longer"*. `//bup tune` shows the current margin.
+- The chocobo can't move while a dig is playing (the animation freezes it, and the dig lands wherever it stopped). So the pace is: dig, about 3 to 5.5 seconds for the result, then the move, then the next dig. A shorter `distance` (it can't go below `mindist`, 2 yalms) means a shorter move and quicker digs: `//bup set distance 3`.
 - Want it to look less robotic? `//bup set humanize 0.5` adds up to half a second of random delay to each dig.
 - Skill-ups are read from the game's line *"Your wing skill improved to 15!"* (confirmed in game). Other lines with "wing skill" and a level are matched too. If the number is ever wrong, set it with `//bup wing <level>`.
 - A skill-up that only says it rose by a point can't be used until BirdUp knows your starting level.
@@ -269,7 +268,7 @@ How long a dig result takes to show up depends on your connection. With `tune` o
 
 If results suddenly slow down, BirdUp may give up on a dig before its result arrives. Results always come back in the order the digs were sent, so when the late one arrives it's matched to the dig BirdUp gave up on and recorded properly. You'll see *"That dig worked after all (the result took 6.5s)"*, and BirdUp waits longer from then on. `//bup tune` shows the measured times and the current wait.
 
-Dig results arrive when the dig animation ends (about 4 seconds in). With `movedig` on (the default) BirdUp moves during the dig and sends the next dig as soon as the result arrives. With `movedig` off, the result tells BirdUp the dig is finished and it waits only a short buffer (`settle`, 0.3s) before moving on.
+Dig results arrive when the dig animation ends (about 4 seconds in), so the result itself tells BirdUp the dig is finished. It then waits only a short buffer (`settle`, 0.3s) before moving on.
 
 ### Area delay after zoning
 
@@ -440,7 +439,7 @@ BirdUp remembers the wall's position and direction until you're 10 yalms past it
 
 ### Staying in one area
 
-When auto-dig starts, the spot you're standing on becomes the center of the digging area. After every dig (right away with `movedig` on, or once the result is in with it off), the chocobo either carries on the way it was going or turns to a random heading (`turnchance`, default a 50% chance to turn), and only then starts moving to the next spot. If carrying on, or the new heading, would take the next dig outside the area (`area`, default 20 yalms), it picks another one, or heads back toward the center if none fits. `//bup anchor` moves the center to where you are now.
+When auto-dig starts, the spot you're standing on becomes the center of the digging area. After every dig, once its result is in, the chocobo either carries on the way it was going or turns to a random heading (`turnchance`, default a 50% chance to turn), and only then starts moving to the next spot. If carrying on, or the new heading, would take the next dig outside the area (`area`, default 20 yalms), it picks another one, or heads back toward the center if none fits. `//bup anchor` moves the center to where you are now.
 
 The game's map grid squares (like H-8) aren't the same size in every zone, so BirdUp uses a circle around your start point instead. Set `area` to roughly the size of the grid square you want to stay in.
 
@@ -456,7 +455,7 @@ Some patches of ground can't be dug. When auto-dig hits one, it doesn't stop:
 
 That spot isn't counted as a dig.
 
-*"You must wait longer to perform that action."* means a dig went in too soon (the last dig was still playing, or the cooldown hadn't finished). That's not bad ground: auto-dig digs the same spot again a quarter second later and adds a little to its timing margin (with `movedig` off it waits a second).
+*"You must wait longer to perform that action."* means a dig went in too soon (the last dig was still playing, or the cooldown hadn't finished). That's not bad ground: auto-dig waits a second and digs the same spot again.
 
 ---
 
@@ -488,13 +487,13 @@ These are in `settings.xml` and can be changed with the commands above.
 |---------|---------|---------|
 | `dig_interval` | 4 | No longer used (the Wing Skill cooldown sets the pace). |
 | `extra_wait` | 0 | Extra seconds on top of the dig cooldown. |
-| `move_during_dig` | true | Dig on the cooldown and move during each dig (`movedig`). |
+| `move_during_dig` | false | No longer used (the chocobo can't move during a dig). |
 | `humanize` | 0 | Up to this many random extra seconds per dig. |
 | `jitter` | 0.6 | No longer used (see `humanize`). |
 | `required_distance` | 5 | Yalms (2D) to travel between digs. |
 | `min_distance` | 2 | Never dig closer than this to the last dig (`mindist`). |
 | `move_timeout` | 8 | Seconds before a movement attempt is abandoned and it turns. |
-| `result_buffer` | 0.3 | With `move_during_dig` off: seconds after a dig result before turning and moving. |
+| `result_buffer` | 0.3 | Seconds after a dig result before turning and moving. |
 | `dig_settle` | 2.5 | No longer used (the dig result means the dig has finished). |
 | `turn_chance` | 50 | % chance to turn after a dig. |
 | `bad_ground_limit` | 7 | Failed digs in a row before auto-dig stops and alerts you. |
