@@ -1,6 +1,6 @@
 _addon.name     = 'birdup'
 _addon.author   = 'Valdimar @ Phoenix' -- auto-dig based on Velner/chocodig
-_addon.version  = '4.9'
+_addon.version  = '5.0'
 _addon.commands = {'birdup', 'bup'}
 
 -- Says in chat when a newer version is on GitHub (once per load; see update_check.lua)
@@ -157,8 +157,11 @@ end
 -- write one timestamped line to the debug log (does nothing while debug is off)
 local function dbg(kind, msg)
     if not debug_f then return end
-    local t = os.clock()
-    debug_f:write(('%s.%03d  %-6s %s\n'):format(os.date('%H:%M:%S'), math.floor((t % 1) * 1000), kind, escape(msg)))
+    -- one clock for the seconds and the milliseconds (os.date's second and
+    -- os.clock's fraction don't tick over together, which put lines out of order)
+    if not S.dbg_t0 then S.dbg_t0, S.dbg_c0 = os.time(), os.clock() end
+    local t = S.dbg_t0 + (os.clock() - S.dbg_c0)
+    debug_f:write(('%s.%03d  %-6s %s\n'):format(os.date('%H:%M:%S', math.floor(t)), math.floor((t % 1) * 1000), kind, escape(msg)))
     debug_f:flush()
 end
 
@@ -2707,6 +2710,7 @@ COMMANDS[#COMMANDS + 1] = {function(cmd, a) return cmd == 'debug' end, function(
             windower.create_dir(windower.addon_path .. 'data/debug')
             debug_path = 'data/debug/debug_' .. os.date('%Y%m%d_%H%M%S') .. '.txt'
             debug_f = io.open(windower.addon_path .. debug_path, 'w')
+            S.dbg_t0 = nil -- restart the log clock
             if not debug_f then log('Could not create the debug file.') return end
             debug_f:write(('BirdUp %s debug log, started %s\n'):format(_addon.version, os.date('%Y-%m-%d %H:%M:%S')))
             debug_f:write(('Zone: %s | Wing Skill: %s | Hyper: %s\n\n'):format(
