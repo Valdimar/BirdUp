@@ -2,7 +2,7 @@
 
 A Windower 4 addon for Final Fantasy XI that automates chocobo digging and tracks everything about it: fatigue, free digs, inventory space, and every item you find. It combines the auto-dig behavior of [Velner/chocodig](https://github.com/Velner/chocodig) with dig tracking, all shown on one draggable HUD.
 
-**Author:** Valdimar @ Phoenix  **Version:** 4.8  **Commands:** `//birdup` or `//bup`
+**Author:** Valdimar @ Phoenix  **Version:** 4.9  **Commands:** `//birdup` or `//bup`
 
 > Status: untested release. Run short sessions first and watch the Windower console for Lua errors.
 
@@ -11,7 +11,7 @@ A Windower 4 addon for Final Fantasy XI that automates chocobo digging and track
 ## Features
 
 - **City prices:** vendor prices are kept per city (fame changes what vendors pay), and you're told when you sell somewhere that pays less.
-- **Auto-dig:** dig > wait for the result > move > dig. The dig animation freezes the chocobo in place and the dig lands where it stands, so it stays put until the result comes in, then moves to the next spot and digs again as soon as it has stopped. It waits until the chocobo has fully stopped before each dig, so a dig is never wasted while it's still sliding. It turns when stuck. Digs are 5 yalms apart (`distance`), and never closer than 2 (`mindist`). If it runs into a wall before it's gone far enough, it digs right there and then turns away, as long as that's at least 2 yalms from the last dig. Otherwise it just turns away. After each dig finishes it either carries on the same way or turns to a random new heading (50/50 by default), while staying within an area around where you started. On ground that can't be dug, it turns roughly around, moves a few yalms and tries again.
+- **Auto-dig:** digs as fast as the game allows. It faces the next heading, sends `/dig` while standing still, and starts running the moment the game has the dig. The dig animation stops the chocobo about a second later, usually 2 to 5 yalms on, and the next dig goes from right there as soon as the result is in. No extra move, no extra stop. It waits until the chocobo has fully stopped before each dig, so a dig is never wasted while it's still sliding. It turns when stuck. Digs are 5 yalms apart (`distance`), and never closer than 2 (`mindist`). If it runs into a wall before it's gone far enough, it digs right there and then turns away, as long as that's at least 2 yalms from the last dig. Otherwise it just turns away. After each dig finishes it either carries on the same way or turns to a random new heading (50/50 by default), while staying within an area around where you started. On ground that can't be dug, it turns roughly around, moves a few yalms and tries again.
 - **Wing Skill:** reads your Wing Skill from chat and sets the dig cooldown to match (never digs faster than the game allows).
 - **Start / Stop buttons:** click them right on the panel.
 - **Daily history:** one log per Japan day, with every session that day added together.
@@ -188,7 +188,8 @@ Each of these takes `on` or `off`; without one, it switches between the two.
 | `area` | 20 | Stay within this many yalms of where auto-dig started (0 = no limit). |
 | `turnchance` | 50 | % chance to turn after a dig instead of carrying on. |
 | `turn` | 3 | Yalms to move after undiggable ground. |
-| `settle` | 0.3 | Seconds after a dig result before turning and moving. |
+| `rundig` | on | Run during each dig (fast). Off = wait for each result, then move and stop before the next dig. |
+| `settle` | 0.3 | With `rundig` off: seconds after a dig result before turning and moving. |
 | `timer` | 0 | Extra seconds on top of the dig cooldown. |
 | `humanize` | 0 | Up to this many random extra seconds per dig (0 = dig right on the cooldown). `jitter` still works as another name for it. |
 | `tune` | on | Self-tuning no-result wait. |
@@ -247,7 +248,8 @@ Since the March 2026 update, chocobo digging skill is called **Wing Skill**, and
 
 - BirdUp reads your Wing Skill from skill-up lines in chat and remembers it per character.
 - The game also won't take a new dig until the last dig's animation has finished, which is when its result shows up (3 to 5.5 seconds after the dig). A `/dig` sent before that is silently ignored: no message, no dig. So at Wing Skill 30+ the animation, not the 3-second cooldown, is what sets the pace.
-- The chocobo can't move while a dig is playing (the animation freezes it, and the dig lands wherever it stopped). So the pace is: dig, about 3 to 5.5 seconds for the result, then the move, then the next dig. A shorter `distance` (it can't go below `mindist`, 2 yalms) means a shorter move and quicker digs: `//bup set distance 3`.
+- The game won't take a new dig until the last one's animation has finished, which is when its result shows up (3 to 5.5 seconds after the dig). So that, not the 3-second cooldown, sets the pace: one dig every 3.5 to 5.5 seconds.
+- The game handles a dig the moment its packet arrives, while the chocobo is still standing on the spot. BirdUp starts running right after that packet goes out. About a second later the animation stops the chocobo, and the next dig goes from there once the result is in. If the chocobo got less than `mindist` (2 yalms) before it was stopped, BirdUp moves the rest of the way after the result.
 - Want it to look less robotic? `//bup set humanize 0.5` adds up to half a second of random delay to each dig.
 - Skill-ups are read from the game's line *"Your wing skill improved to 15!"* (confirmed in game). Other lines with "wing skill" and a level are matched too. If the number is ever wrong, set it with `//bup wing <level>`.
 - A skill-up that only says it rose by a point can't be used until BirdUp knows your starting level.
@@ -489,7 +491,8 @@ These are in `settings.xml` and can be changed with the commands above.
 |---------|---------|---------|
 | `dig_interval` | 4 | No longer used (the Wing Skill cooldown sets the pace). |
 | `extra_wait` | 0 | Extra seconds on top of the dig cooldown. |
-| `move_during_dig` | false | No longer used (the chocobo can't move during a dig). |
+| `move_during_dig` | false | No longer used (see `run_during_dig`). |
+| `run_during_dig` | true | Run during each dig; next dig right after the result (`rundig`). |
 | `humanize` | 0 | Up to this many random extra seconds per dig. |
 | `jitter` | 0.6 | No longer used (see `humanize`). |
 | `required_distance` | 5 | Yalms (2D) to travel between digs. |

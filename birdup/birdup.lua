@@ -1,6 +1,6 @@
 _addon.name     = 'birdup'
 _addon.author   = 'Valdimar @ Phoenix' -- auto-dig based on Velner/chocodig
-_addon.version  = '4.8'
+_addon.version  = '4.9'
 _addon.commands = {'birdup', 'bup'}
 
 -- Says in chat when a newer version is on GitHub (once per load; see update_check.lua)
@@ -68,7 +68,8 @@ local defaults = {
     result_buffer     = 0.3,   -- seconds after a dig result before turning and moving (//bup settle)
     turn_chance       = 50,    -- % chance to turn after a dig (otherwise keep going the same way)
     roam_radius       = 20,    -- stay within this many yalms of where auto-dig started (0 = no limit)
-    move_during_dig   = false, -- no longer used: the dig animation freezes the chocobo, so it can't move during a dig
+    move_during_dig   = false, -- no longer used (see run_during_dig)
+    run_during_dig    = true,  -- start running once the dig is sent; next dig right after the result (//bup set rundig)
     stop_settle       = 0.4,   -- seconds the chocobo must be standing still before a dig
     result_timeout    = 5,     -- used until auto_tune has enough measurements
     auto_tune         = true,  -- set the no-result wait from how fast results really arrive
@@ -1352,7 +1353,7 @@ local function can_dig_here()
     local d = dist2d(pos, last_dig_pos)
     -- a retry (wall, refused dig) may dig short of the full distance, but
     -- never closer than min_distance to the last dig
-    if retry_here then return d >= (settings.min_distance or 2) end
+    if retry_here or S.ran then return d >= (settings.min_distance or 2) end
     return d >= settings.required_distance
 end
 
@@ -1530,7 +1531,22 @@ local function attempt_dig()
         dbg('DIG', prev_dig_pos and ('%.1f yalms from the last dig'):format(dist2d(last_dig_pos, prev_dig_pos)) or 'first dig')
     end
     retry_here = false
+    S.ran = false -- no run started for this dig yet
     need_spin = true
+    -- running during the dig: face the next heading NOW, while standing still
+    -- (turning doesn't move the dig), so the run can start the instant the
+    -- game has the dig and use all of the second before the animation stops it
+    if settings.run_during_dig and last_dig_pos then
+        if wall_hit then
+            local base = S.wall and S.wall.facing or ((get_me() or {}).facing or 0)
+            windower.ffxi.turn((base + math.pi + (math.random() * 2 - 1) * math.pi / 3) % (2 * math.pi))
+            wall_hit = false
+        else
+            local f = roam_heading(last_dig_pos)
+            if f then windower.ffxi.turn(f % (2 * math.pi)) end
+        end
+        need_spin = false
+    end
     -- movedig: the previous dig's result may still be coming (results take ~4s,
     -- the cooldown is shorter). Remember it so its result is matched to it.
     if auto_wait then S.prev_wait = auto_wait end
@@ -1967,6 +1983,7 @@ windower.register_event('outgoing chunk', function(id, data)
     if id == 0x01A and #data >= 12 and u16(data, 11) == 0x11 then
         dbg('PKT', 'dig action sent')
         S.pending = os.clock()
+        S.pkt_t = S.pending -- the game has the dig now: safe to start running
         return
     end
     if id == 0x084 and #data >= 11 then        -- vendor: item picked to sell
@@ -2040,6 +2057,13 @@ local function tick(now)
         -- away. If it's blocked again straight after, turn away without digging.
         local function blocked(why)
             stop_moving()
+            -- the dig animation stops the chocobo dead about a second after the
+            -- dig: that's not a wall. Wait there; the next dig goes from here.
+            if auto_wait then
+                dbg('MOVE', ('dig animation stopped the run, %.1f yalms from the last dig'):format(
+                    (pos and last_dig_pos) and dist2d(pos, last_dig_pos) or 0))
+                return
+            end
             blocked_count = blocked_count + 1
             -- remember the wall: where it is and which way it faces us
             local me = get_me()
@@ -2123,14 +2147,24 @@ local function tick(now)
             bad_ground('no result') -- nothing came back: treat the spot as undiggable
             return
         end
-        -- the dig animation freezes the chocobo where it stands, and the dig
-        -- lands there: moving off during a dig just puts the dig (and the
-        -- next one) in the same spot. So stand still until the result is in.
+        -- run during the dig: the game handles the dig the moment its packet
+        -- arrives (while we're still standing on the spot), so start running
+        -- just after the packet has gone out. The animation stops the chocobo
+        -- about a second later, usually 2-5 yalms on, and the next dig goes
+        -- from there as soon as the result is in: no extra move or stop.
+        if settings.run_during_dig and not S.ran and not moving then
+            local sent = S.pkt_t and S.pkt_t >= auto_wait
+            if (sent and now >= S.pkt_t + 0.1) or now >= auto_wait + 0.6 then
+                S.ran = true
+                go()
+            end
+        end
         return
     end
 
-    -- movedig off: a short pause after each result before moving on
-    if now < settle_until then return end
+    -- a short pause after each result before moving on (not needed when the
+    -- chocobo already ran during the dig)
+    if now < settle_until and not S.ran then return end
 
     if now < next_dig then
         if not can_dig_here() then go() end
@@ -2339,6 +2373,7 @@ local SETTINGS = {
     groups = {
         {'Auto-dig', {
             {'distance',    'required_distance', 'num',   'yalms to travel between digs'},
+            {'rundig',      'run_during_dig',    'onoff', 'run during each dig (much faster); off = wait for the result, then move'},
             {'mindist',     'min_distance',      'num',   'never dig closer than this to the last dig (walls, retries)'},
             {'area',        'roam_radius',       'num',   'stay within this many yalms of the start (0 = no limit)'},
             {'turnchance',  'turn_chance',       'pct',   '% chance to turn after a dig'},
