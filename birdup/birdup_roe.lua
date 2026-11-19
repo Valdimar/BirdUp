@@ -81,8 +81,11 @@ return function(ctx)
         if not R.cur then return nil end
         local extra = ''
         if R.done > 0 then
-            extra = ('  (%d done, +%s sparks)'):format(R.done, ctx.commas(R.sparks))
+            extra = ('  (%d done, +%s sparks)'):format(R.done, ctx.commas(R.sparks or 0))
         end
+        -- the target (e.g. 30) is only known once a "Progress: a/b" line has
+        -- been seen: after a reload, a completion can come first
+        if not R.max then return ('%s %d'):format(R.short_name(), R.cur), extra end
         return ('%s %d/%d'):format(R.short_name(), R.cur, R.max), extra
     end
 
