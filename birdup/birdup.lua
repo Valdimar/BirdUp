@@ -1,6 +1,6 @@
 _addon.name     = 'birdup'
 _addon.author   = 'Valdimar @ Phoenix' -- auto-dig based on Velner/chocodig
-_addon.version  = '4.5'
+_addon.version  = '4.6'
 _addon.commands = {'birdup', 'bup'}
 
 -- Says in chat when a newer version is on GitHub (once per load; see update_check.lua)
@@ -2044,7 +2044,7 @@ local function tick(now)
             -- remember the wall: where it is and which way it faces us
             local me = get_me()
             if pos and me and me.facing then S.wall = {pos = pos, facing = me.facing} end
-            dbg('MOVE', ('blocked (%s), count %d, %.1f yalms from the last dig, %.1f moved in the last %.0fs (top speed %.1f/s)%s'):format(
+            dbg('MOVE', ('blocked (%s), count %d, %.1f yalms from the last dig, %.1f moved in the last %.0fs (normal speed %.1f/s)%s'):format(
                 why, blocked_count, (pos and last_dig_pos) and dist2d(pos, last_dig_pos) or 0,
                 (pos and prog_pos) and dist2d(pos, prog_pos) or 0, settings.stuck_check_time, S.run_speed or 0,
                 auto_wait and ', dig playing' or ''))
@@ -2073,7 +2073,20 @@ local function tick(now)
             else
                 -- learn normal running speed (top speed seen, slowly forgotten)
                 local spd = moved / (now - prog_time)
-                if not auto_wait then S.run_speed = math.max(spd, (S.run_speed or 0) * 0.98) end
+                -- normal running speed = the middle of the last 15 readings (not
+                -- the fastest one): speed addons, mount changes and position jumps
+                -- can give odd readings, and one fast spike made every normal
+                -- second after it look like a wall
+                if not auto_wait then
+                    local r = S.spd_samples or {}
+                    S.spd_samples = r
+                    r[#r + 1] = spd
+                    if #r > 15 then table.remove(r, 1) end
+                    local sorted = {}
+                    for i, v in ipairs(r) do sorted[i] = v end
+                    table.sort(sorted)
+                    S.run_speed = sorted[math.floor(#sorted / 2) + 1]
+                end
                 prog_time, prog_pos = now, pos
             end
         elseif now - move_start_time >= settings.move_timeout then
