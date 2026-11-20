@@ -1,6 +1,6 @@
 _addon.name     = 'birdup'
 _addon.author   = 'Valdimar @ Phoenix' -- auto-dig based on Velner/chocodig
-_addon.version  = '5.0'
+_addon.version  = '5.1'
 _addon.commands = {'birdup', 'bup'}
 
 -- Says in chat when a newer version is on GitHub (once per load; see update_check.lua)
@@ -122,7 +122,7 @@ local S = {
     pending = nil,            -- os.clock() of last /dig, awaiting a result
 }
 -- this character's lifetime totals plus today's fatigue (data/lifetime_<name>.txt)
-local life = {attempts = 0, successes = 0, drops = {}, fatigue = 0, free = 0, day = 0, cur = {}, gil = 0, wing = nil, wing_approx = false, discern = 0}
+local life = {attempts = 0, successes = 0, drops = {}, fatigue = 0, free = 0, day = 0, cur = {}, gil = 0, wing = nil, wing_approx = false, discern = 0, spent = 0, bought = 0}
 -- unsaved changes? / when lifetime was last saved
 local life_dirty, life_saved = false, 0
 
@@ -264,8 +264,8 @@ local function dist2d(a, b)
 end
 
 -- count Gysahl Greens and used/max inventory slots (at most once a second)
-local function refresh_greens(now)
-    if now - greens_time < 1 then return end
+local function refresh_greens(now, force)
+    if not force and now - greens_time < 1 then return end
     greens_time = now
     local items = windower.ffxi.get_items()
     if not items or not items.inventory then greens = nil inv_used, inv_max = nil, nil return end
@@ -298,7 +298,8 @@ local history = {} -- yyyymmdd (JST) -> entry
 -- an empty daily-history entry
 local function new_day_entry()
     return {attempts = 0, finds = 0, fails = 0, fatigue = 0, free = 0, sessions = 0,
-            secs = 0, gil = 0, wing = nil, discern = 0, roe = 0, cur = {}, drops = {}}
+            secs = 0, gil = 0, wing = nil, discern = 0, roe = 0, cur = {}, drops = {},
+            spent = 0, bought = 0} -- gil spent buying Gysahl Greens, and how many
 end
 
 -- data/history_<name>.txt for the current character
@@ -325,6 +326,7 @@ local function load_history()
             for k, n in (p[12] or ''):gmatch('([^=|]+)=(%d+)') do e.drops[k] = tonumber(n) end
             e.discern = tonumber(p[13]) or 0
             e.roe = tonumber(p[14]) or 0
+            e.spent, e.bought = tonumber(p[15]) or 0, tonumber(p[16]) or 0
             history[d] = e
         end
     end
@@ -344,9 +346,10 @@ save_history = function()
         local cur, drops = {}, {}
         for k, n in pairs(e.cur) do cur[#cur + 1] = k .. '=' .. n end
         for k, n in pairs(e.drops) do drops[#drops + 1] = k .. '=' .. n end
-        f:write(('%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%s\t%s\t%s\t%d\t%d\n'):format(
+        f:write(('%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%s\t%s\t%s\t%d\t%d\t%d\t%d\n'):format(
             d, e.attempts, e.finds, e.fails, e.fatigue, e.free, e.sessions, e.secs, e.gil,
-            e.wing and tostring(e.wing) or '', table.concat(cur, '|'), table.concat(drops, '|'), e.discern or 0, e.roe or 0))
+            e.wing and tostring(e.wing) or '', table.concat(cur, '|'), table.concat(drops, '|'), e.discern or 0, e.roe or 0,
+            e.spent or 0, e.bought or 0))
     end
     f:close()
 end
@@ -361,7 +364,7 @@ end
 -- are item counts. Item names saved by older versions are cleaned up here.
 local function load_life()
     life = {attempts = 0, successes = 0, drops = {}, fatigue = 0, free = 0, day = 0, cur = {}, gil = 0,
-            wing = nil, wing_approx = false, discern = 0}
+            wing = nil, wing_approx = false, discern = 0, spent = 0, bought = 0}
     life_dirty = false
     local f = io.open(life_path(), 'r')
     if not f then return end
@@ -377,6 +380,8 @@ local function load_life()
             elseif k == '#gil' then life.gil = tonumber(v)
             elseif k == '#wing' then life.wing = tonumber(v)
             elseif k == '#discern' then life.discern = tonumber(v)
+            elseif k == '#spent' then life.spent = tonumber(v)
+            elseif k == '#bought' then life.bought = tonumber(v)
             elseif k == '#wing_approx' then life.wing_approx = tonumber(v) == 1
             else
                 -- merge names saved by older versions ("Pebble.<code>1") into the plain name
@@ -400,7 +405,7 @@ local function save_life(force)
     f:write(('#attempts\t%d\n#successes\t%d\n#fatigue\t%d\n#free\t%d\n#day\t%d\n'):format(
         life.attempts, life.successes, life.fatigue, life.free, life.day))
     for key, n in pairs(life.cur) do f:write(('#cur_%s\t%d\n'):format(key, n)) end
-    f:write(('#gil\t%d\n#discern\t%d\n'):format(life.gil, life.discern))
+    f:write(('#gil\t%d\n#discern\t%d\n#spent\t%d\n#bought\t%d\n'):format(life.gil, life.discern, life.spent or 0, life.bought or 0))
     if life.wing then
         f:write(('#wing\t%d\n#wing_approx\t%d\n'):format(life.wing, life.wing_approx and 1 or 0))
     end
@@ -1168,6 +1173,9 @@ local function update_hud(now)
     end
 
     rows[#rows + 1] = row('Sold', C.good .. commas(life.gil) .. C.r .. C.dim .. ' gil (+' .. commas(td.gil) .. ' today)' .. C.r)
+    -- gil spent buying Gysahl Greens from shops
+    rows[#rows + 1] = row('Bought', C.bad .. commas(life.spent or 0) .. C.r .. C.dim .. (' gil, %s greens (%s today)'):format(
+        commas(life.bought or 0), commas(td.spent or 0)) .. C.r)
     rows[#rows + 1] = row('Est. val', commas(value_of(life.drops)) .. C.dim .. ' gil (+' .. commas(value_of(td.drops)) .. ' today)' .. C.r)
 
     -- a currency row: lifetime total plus today's gain
@@ -1989,6 +1997,17 @@ windower.register_event('outgoing chunk', function(id, data)
         S.pkt_t = S.pending -- the game has the dig now: safe to start running
         return
     end
+    if id == 0x083 then                        -- shop: buying something
+        -- note gil and greens now; check_sales() sees if greens came in for gil.
+        -- A second buy before that keeps the first starting point.
+        local gil = windower.ffxi.get_items('gil')
+        if type(gil) == 'number' then
+            refresh_greens(os.clock(), true)
+            if not S.buy then S.buy = {gil0 = gil, g0 = greens or 0} end
+            S.buy.t = os.clock()
+        end
+        return
+    end
     if id == 0x084 and #data >= 11 then        -- vendor: item picked to sell
         sell_req = {count = u32(data, 5), id = u16(data, 9), t = os.clock()}
     elseif id == 0x085 and sell_req then        -- vendor: sale confirmed
@@ -2005,6 +2024,23 @@ end)
 
 -- after a confirmed sale, wait (up to 5s) for the gil to arrive and record it
 local function check_sales(now)
+    -- a shop purchase: more greens and less gil = gil spent on greens
+    if S.buy and now - (S.buy_check_t or 0) >= 0.2 then
+        S.buy_check_t = now
+        local gil = windower.ffxi.get_items('gil')
+        refresh_greens(now, true)
+        local got = (greens or 0) - S.buy.g0
+        if type(gil) == 'number' and got > 0 and gil < S.buy.gil0 then
+            local cost, td = S.buy.gil0 - gil, today()
+            life.spent, life.bought = (life.spent or 0) + cost, (life.bought or 0) + got
+            td.spent, td.bought = (td.spent or 0) + cost, (td.bought or 0) + got
+            life_dirty = true
+            log(('Bought %d Gysahl Greens for %s gil (%s each).'):format(got, commas(cost), commas(math.floor(cost / got + 0.5))))
+            S.buy = nil
+        elseif now - S.buy.t > 5 then
+            S.buy = nil -- not greens, or the purchase didn't go through
+        end
+    end
     if not sale_pending or now - sale_check_t < 0.2 then return end
     sale_check_t = now
     local gil = windower.ffxi.get_items('gil')

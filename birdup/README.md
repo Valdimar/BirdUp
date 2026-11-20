@@ -2,7 +2,7 @@
 
 A Windower 4 addon for Final Fantasy XI that automates chocobo digging and tracks everything about it: fatigue, free digs, inventory space, and every item you find. It combines the auto-dig behavior of [Velner/chocodig](https://github.com/Velner/chocodig) with dig tracking, all shown on one draggable HUD.
 
-**Author:** Valdimar @ Phoenix  **Version:** 5.0  **Commands:** `//birdup` or `//bup`
+**Author:** Valdimar @ Phoenix  **Version:** 5.1  **Commands:** `//birdup` or `//bup`
 
 > Status: untested release. Run short sessions first and watch the Windower console for Lua errors.
 
@@ -110,6 +110,7 @@ The HUD appears automatically when you get on a chocobo and hides when you get o
 | RoE | Your Records of Eminence chocobo digging objective, for example `Chocobo Digs 21/30`, plus completions and sparks earned this session. Appears after your first successful dig. |
 | Lifetime | Total finds for this character. |
 | Sold | Gil you've earned selling dug-up items to vendors (lifetime, plus today). |
+| Bought | Gil you've spent buying Gysahl Greens from shops, how many you've bought (lifetime), and gil spent today. |
 | Est. val | Estimated gil value of your finds at the prices BirdUp has learned (lifetime, plus today). |
 | Conquest | Lifetime conquest points earned from digging, with this session's gain. Imperial, Allied and Bayld rows appear once you've earned any. |
 | Items found | Click the **ITEMS FOUND** header to collapse or expand the list (`[+]` / `[-]`). Every item type found today (since midnight JST) or in your lifetime, most common first, with counts and `@price` each where known. Prices up to 9,999 are shown in full (`@1,234`); higher ones are rounded to the nearest half thousand or half million (`@30.5k` for 30,251, `@250k`, `@1.5m`). `//bup prices` always shows the full number. Today's list survives reloads and logouts and only clears at the JST day change. The panel grows to fit. |
@@ -400,6 +401,7 @@ Details:
 - **Clean-up:** older versions could save prices for items you never dug. `//bup prices clean` removes them.
 - **Last sale wins:** each sale replaces the saved price, so the price follows what you most recently got.
 - **Auction house prices:** set those by hand with `//bup price <item> <gil>`.
+- **Greens you buy:** when you buy from a shop (a chocobo stable or any vendor) and your Gysahl Greens go up while your gil goes down, BirdUp counts the gil as spent on greens and says so in chat: `Bought 12 Gysahl Greens for 744 gil (62 each).` Buying anything else isn't counted. Greens from the Auction House, a bazaar or a trade aren't counted either. Totals are per character, lifetime and per day.
 - **Shared prices:** one price list for all your characters, in `data/prices.txt`. A sale on any character updates it. The **Sold** total (gil earned) is still per character.
 - **Estimates only:** NPC prices are usually far below auction prices. Use `//bup price` if you want values based on what the item really sells for.
 
