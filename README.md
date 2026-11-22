@@ -2,7 +2,7 @@
 
 A Windower 4 addon for Final Fantasy XI that automates chocobo digging and tracks everything about it: fatigue, free digs, inventory space, and every item you find. It combines the auto-dig behavior of [Velner/chocodig](https://github.com/Velner/chocodig) with dig tracking, all shown on one draggable HUD.
 
-**Author:** Valdimar @ Phoenix  **Version:** 5.1  **Commands:** `//birdup` or `//bup`
+**Author:** Valdimar @ Phoenix  **Version:** 5.2  **Commands:** `//birdup` or `//bup`
 
 ---
 
@@ -79,7 +79,7 @@ The game can pause for a moment while it checks (at most 3 seconds, usually much
 3. Click **START** on the panel (or type `//bup start`).
 4. Click **STOP** (or `//bup stop`) any time. `//bup pause` pauses; the START button then reads **RESUME**.
 
-The HUD appears automatically when you get on a chocobo and hides when you get off (turn this off with `//bup set autohide off`). Tracking runs in the background either way, so manual `/dig` use is still counted.
+The HUD appears automatically when you get on a chocobo (rental or your own; other mounts from the Mounts menu don't count, since they can't dig) and hides when you get off (turn this off with `//bup set autohide off`). Tracking runs in the background either way, so manual `/dig` use is still counted.
 
 ---
 
@@ -246,8 +246,7 @@ Since the March 2026 update, chocobo digging skill is called **Wing Skill**, and
 | Novice to Expert | 30-100 | 3s | 45s down to 10s |
 
 - BirdUp reads your Wing Skill from skill-up lines in chat and remembers it per character.
-- The game also won't take a new dig until the last dig's animation has finished, which is when its result shows up (3 to 5.5 seconds after the dig). A `/dig` sent before that is silently ignored: no message, no dig. So at Wing Skill 30+ the animation, not the 3-second cooldown, is what sets the pace.
-- The game won't take a new dig until the last one's animation has finished, which is when its result shows up (3 to 5.5 seconds after the dig). So that, not the 3-second cooldown, sets the pace: one dig every 3.5 to 5.5 seconds.
+- The game won't take a new dig until the last one's animation has finished, which is when its result shows up (3 to 5.5 seconds after the dig). A `/dig` sent before that is silently ignored. So that, not the 3-second cooldown, sets the pace: one dig every 3.5 to 5.5 seconds.
 - The game handles a dig the moment its packet arrives, while the chocobo is still standing on the spot. BirdUp starts running right after that packet goes out. About a second later the animation stops the chocobo, and the next dig goes from there once the result is in. If the chocobo got less than `mindist` (2 yalms) before it was stopped, BirdUp moves the rest of the way after the result.
 - Want it to look less robotic? `//bup set humanize 0.5` adds up to half a second of random delay to each dig.
 - Skill-ups are read from the game's line *"Your wing skill improved to 15!"* (confirmed in game). Other lines with "wing skill" and a level are matched too. If the number is ever wrong, set it with `//bup wing <level>`.
@@ -532,7 +531,7 @@ These are in `settings.xml` and can be changed with the commands above.
 
 ## Known limitations
 
-- **Untested in game:** the movement calls (`windower.ffxi.run` and `turn`), the mount check (status 5 for chocobo, 85 for the mount system; other mounts also count as mounted), and the HUD's `images` rectangles haven't been confirmed on a live client.
+- **Untested in game:** the movement calls (`windower.ffxi.run` and `turn`), the mount check (status 5 = riding a chocobo; status 85, other mounts, doesn't count), and the HUD's `images` rectangles haven't been confirmed on a live client.
 - **Multi-item digs:** whether a dig that returns more than one item (such as Bore or Burrow) adds one fatigue or several is unconfirmed. BirdUp assumes one.
 - **Game messages:** *"You cannot dig here."* and *"You must wait longer to perform that action."* are confirmed from a debug log. The "inventory full" wording is still a best guess.
 - **Sale detection:** reads the vendor sell packets (0x084 pick, 0x085 confirm), then the gil that arrives within 5 seconds. If a price looks wrong, correct it with `//bup price`.

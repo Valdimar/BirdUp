@@ -1,6 +1,6 @@
 _addon.name     = 'birdup'
 _addon.author   = 'Valdimar @ Phoenix' -- auto-dig based on Velner/chocodig
-_addon.version  = '5.1'
+_addon.version  = '5.2'
 _addon.commands = {'birdup', 'bup'}
 
 -- Says in chat when a newer version is on GitHub (once per load; see update_check.lua)
@@ -102,10 +102,11 @@ local defaults = {
 local settings = config.load(defaults)
 
 K.GREENS_ID   = 4545
--- player.status while riding: 5 = chocobo (rental/whistle), 85 = mount system
-K.MOUNT_STATUSES = {[5] = true, [85] = true}
+-- player.status while riding: 5 = chocobo (rental or your own, by whistle),
+-- 85 = a mount from the Mounts menu. Only a chocobo can dig, so only 5 counts.
+K.MOUNT_STATUSES = {[5] = true}
 
--- true while riding a chocobo (or any mount: the game can't tell them apart)
+-- true while riding a chocobo (not other mounts)
 local function is_mounted()
     local p = windower.ffxi.get_player()
     return p and K.MOUNT_STATUSES[p.status] or false
