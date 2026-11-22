@@ -2,7 +2,7 @@
 
 A Windower 4 addon for Final Fantasy XI that automates chocobo digging and tracks everything about it: fatigue, free digs, inventory space, and every item you find. It combines the auto-dig behavior of [Velner/chocodig](https://github.com/Velner/chocodig) with dig tracking, all shown on one draggable HUD.
 
-**Author:** Valdimar @ Phoenix  **Version:** 5.2  **Commands:** `//birdup` or `//bup`
+**Author:** Valdimar @ Phoenix  **Version:** 5.3  **Commands:** `//birdup` or `//bup`
 
 ---
 
@@ -79,7 +79,7 @@ The game can pause for a moment while it checks (at most 3 seconds, usually much
 3. Click **START** on the panel (or type `//bup start`).
 4. Click **STOP** (or `//bup stop`) any time. `//bup pause` pauses; the START button then reads **RESUME**.
 
-The HUD appears automatically when you get on a chocobo (rental or your own; other mounts from the Mounts menu don't count, since they can't dig) and hides when you get off (turn this off with `//bup set autohide off`). Tracking runs in the background either way, so manual `/dig` use is still counted.
+The HUD appears automatically when you get on a chocobo that can dig: a rental, your own by whistle, or the Chocobo from the Mounts menu. The Noble Chocobo and other mounts don't count, since they can't dig. It hides when you get off (turn this off with `//bup set autohide off`). Tracking runs in the background either way, so manual `/dig` use is still counted.
 
 ---
 
@@ -531,7 +531,7 @@ These are in `settings.xml` and can be changed with the commands above.
 
 ## Known limitations
 
-- **Untested in game:** the movement calls (`windower.ffxi.run` and `turn`), the mount check (status 5 = riding a chocobo; status 85, other mounts, doesn't count), and the HUD's `images` rectangles haven't been confirmed on a live client.
+- **Untested in game:** the movement calls (`windower.ffxi.run` and `turn`), the mount check (status 5 = riding a chocobo; status 85 = Mounts menu, where only the Chocobo counts, read from the mount byte of packet 0x037: mount id + 1, Noble Chocobo = 34), and the HUD's `images` rectangles haven't been confirmed on a live client.
 - **Multi-item digs:** whether a dig that returns more than one item (such as Bore or Burrow) adds one fatigue or several is unconfirmed. BirdUp assumes one.
 - **Game messages:** *"You cannot dig here."* and *"You must wait longer to perform that action."* are confirmed from a debug log. The "inventory full" wording is still a best guess.
 - **Sale detection:** reads the vendor sell packets (0x084 pick, 0x085 confirm), then the gil that arrives within 5 seconds. If a price looks wrong, correct it with `//bup price`.

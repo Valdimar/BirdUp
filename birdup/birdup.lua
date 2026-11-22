@@ -1,6 +1,6 @@
 _addon.name     = 'birdup'
 _addon.author   = 'Valdimar @ Phoenix' -- auto-dig based on Velner/chocodig
-_addon.version  = '5.2'
+_addon.version  = '5.3'
 _addon.commands = {'birdup', 'bup'}
 
 -- Says in chat when a newer version is on GitHub (once per load; see update_check.lua)
@@ -103,14 +103,41 @@ local settings = config.load(defaults)
 
 K.GREENS_ID   = 4545
 -- player.status while riding: 5 = chocobo (rental or your own, by whistle),
--- 85 = a mount from the Mounts menu. Only a chocobo can dig, so only 5 counts.
-K.MOUNT_STATUSES = {[5] = true}
+-- 85 = a mount from the Mounts menu. Of those, only the Chocobo mount can dig
+-- (not the Noble Chocobo or anything else).
+K.STATUS_CHOCOBO, K.STATUS_MOUNT = 5, 85
 
--- true while riding a chocobo (not other mounts)
+-- which Mounts-menu mount you're on: byte 0x5B of the character update
+-- packet (0x037) is the mount id + 1 (Noble Chocobo = 33, so 34). The Chocobo
+-- mount (id 0) shows as 0 or 1. Kept in K so it's readable from here.
+function K.mount_byte()
+    if K.mount == nil and windower.packets and windower.packets.last_incoming then
+        local d = windower.packets.last_incoming(0x037)
+        if d and #d >= 0x5C then K.mount = d:byte(0x5C) end
+    end
+    return K.mount
+end
+
+-- true while riding a chocobo that can dig (not other mounts)
 local function is_mounted()
     local p = windower.ffxi.get_player()
-    return p and K.MOUNT_STATUSES[p.status] or false
+    if not p then return false end
+    if p.status == K.STATUS_CHOCOBO then return true end
+    if p.status ~= K.STATUS_MOUNT then return false end
+    local m = K.mount_byte()
+    return m == nil or m <= 1 -- unknown: assume it's the Chocobo mount
 end
+
+-- keep the mount byte up to date
+windower.register_event('incoming chunk', function(id, data)
+    if id == 0x037 and #data >= 0x5C then
+        local m = data:byte(0x5C)
+        if m ~= K.mount then
+            K.mount = m
+            if K.dbg then K.dbg('MOUNT', ('mount byte %d (%s)'):format(m, m <= 1 and 'chocobo' or m == 34 and 'Noble Chocobo' or 'another mount')) end
+        end
+    end
+end)
 
 ---------------------------------------------------------------------------
 -- State
@@ -165,6 +192,7 @@ local function dbg(kind, msg)
     debug_f:write(('%s.%03d  %-6s %s\n'):format(os.date('%H:%M:%S', math.floor(t)), math.floor((t % 1) * 1000), kind, escape(msg)))
     debug_f:flush()
 end
+K.dbg = dbg -- (for the mount watcher above)
 
 -- BirdUp's chat line ([BirdUp] ...), also copied to the debug log
 local function log(msg)
